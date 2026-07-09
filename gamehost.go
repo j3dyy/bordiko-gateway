@@ -55,6 +55,56 @@ func (g *GameHostClient) GetMatch(ctx context.Context, id string) (*MatchMeta, e
 	return &m, nil
 }
 
+// CreateMatch asks the game-host to set up a new match with the given players
+// (user ids). Used by the lobby once a pending match fills up.
+func (g *GameHostClient) CreateMatch(ctx context.Context, gameID string, players []string) (*MatchMeta, error) {
+	reqBody, _ := json.Marshal(map[string]any{"gameId": gameID, "players": players})
+	body, status, err := g.do(ctx, http.MethodPost, "/matches", reqBody)
+	if err != nil {
+		return nil, err
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("game-host create match: %d %s", status, truncate(body))
+	}
+	var m MatchMeta
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, fmt.Errorf("decode match: %w", err)
+	}
+	return &m, nil
+}
+
+// RatingEntry is one row of a game's leaderboard as returned by the game-host
+// (keyed by player = user id; the gateway resolves display names).
+type RatingEntry struct {
+	Player string  `json:"player"`
+	Rating float64 `json:"rating"`
+	Wins   int     `json:"wins"`
+	Losses int     `json:"losses"`
+	Draws  int     `json:"draws"`
+	Games  int     `json:"games"`
+}
+
+func (g *GameHostClient) GetLeaderboard(ctx context.Context, gameID string) ([]RatingEntry, error) {
+	path := "/leaderboard"
+	if gameID != "" {
+		path += "?gameId=" + gameID
+	}
+	body, status, err := g.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("game-host leaderboard: %d %s", status, truncate(body))
+	}
+	var wrap struct {
+		Entries []RatingEntry `json:"entries"`
+	}
+	if err := json.Unmarshal(body, &wrap); err != nil {
+		return nil, err
+	}
+	return wrap.Entries, nil
+}
+
 // ApplyMove forwards a move and returns the parsed result plus the HTTP status
 // (422 means the guest rejected the move — a normal client error).
 func (g *GameHostClient) ApplyMove(ctx context.Context, id, playerID, mtype string, payload json.RawMessage) (*ApplyResp, int, error) {

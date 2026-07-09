@@ -1,0 +1,17 @@
+.git
+.gitignore
+.dockerignore
+Dockerfile
+README.md
+*.test
+*.out
+*.log
+.env
+.env.*
+/bin/
+# local build outputs
+/registry
+/gateway
+/gamehost
+/game-host
+app

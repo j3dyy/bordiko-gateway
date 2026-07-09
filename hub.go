@@ -14,10 +14,11 @@ type Hub struct {
 	mu    sync.RWMutex
 	rooms map[string]map[*Client]struct{}
 	gh    *GameHostClient
+	auth  *Auth
 }
 
-func NewHub(gh *GameHostClient) *Hub {
-	return &Hub{rooms: make(map[string]map[*Client]struct{}), gh: gh}
+func NewHub(gh *GameHostClient, auth *Auth) *Hub {
+	return &Hub{rooms: make(map[string]map[*Client]struct{}), gh: gh, auth: auth}
 }
 
 func (h *Hub) add(c *Client) {

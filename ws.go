@@ -4,18 +4,47 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
+func contains(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
-	// Dev: accept any origin. Phase-4 hardening ties this to the configured
-	// frontend origin and adds auth on the token.
+	// CheckOrigin is configured at startup (setWSAllowedOrigins) to the same
+	// allow-list used for CORS, so only the configured frontend(s) may connect.
 	CheckOrigin: func(_ *http.Request) bool { return true },
+}
+
+// setWSAllowedOrigins pins the WebSocket origin check to the given set. An empty
+// set keeps the permissive dev default.
+func setWSAllowedOrigins(origins []string) {
+	if len(origins) == 0 {
+		return
+	}
+	allowed := make(map[string]bool, len(origins))
+	for _, o := range origins {
+		allowed[strings.TrimRight(o, "/")] = true
+	}
+	upgrader.CheckOrigin = func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true // non-browser clients (tools, tests) send no Origin
+		}
+		return allowed[origin]
+	}
 }
 
 const (
@@ -47,16 +76,29 @@ type clientMessage struct {
 }
 
 func (h *Hub) serveWS(w http.ResponseWriter, r *http.Request) {
-	matchID := r.URL.Query().Get("matchId")
-	playerID := r.URL.Query().Get("playerId")
-	if matchID == "" || playerID == "" {
-		http.Error(w, "matchId and playerId query params are required", http.StatusBadRequest)
+	// Login is required to play: the player identity comes from the session, not
+	// a query param, so a client can only ever act as itself.
+	claims, ok := h.auth.sessionUser(r)
+	if !ok {
+		http.Error(w, "login required", http.StatusUnauthorized)
 		return
 	}
-	// Confirm the match exists (and is joinable) before upgrading.
+	playerID := claims.Sub
+
+	matchID := r.URL.Query().Get("matchId")
+	if matchID == "" {
+		http.Error(w, "matchId query param is required", http.StatusBadRequest)
+		return
+	}
+	// Confirm the match exists before upgrading.
 	meta, err := h.gh.GetMatch(r.Context(), matchID)
 	if err != nil {
 		http.Error(w, "unknown match", http.StatusNotFound)
+		return
+	}
+	// The authenticated user must be one of the match's players.
+	if !contains(meta.Players, playerID) {
+		http.Error(w, "you are not a player in this match", http.StatusForbidden)
 		return
 	}
 
