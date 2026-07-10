@@ -140,6 +140,24 @@ func (g *GameHostClient) ApplyMove(ctx context.Context, id, playerID, mtype stri
 	return &res, status, nil
 }
 
+// Stats returns per-game match counts (the "plays" metric) from the game-host.
+func (g *GameHostClient) Stats(ctx context.Context) (map[string]int, error) {
+	body, status, err := g.do(ctx, http.MethodGet, "/stats", nil)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("game-host stats: %d %s", status, truncate(body))
+	}
+	var wrap struct {
+		Counts map[string]int `json:"counts"`
+	}
+	if err := json.Unmarshal(body, &wrap); err != nil {
+		return nil, err
+	}
+	return wrap.Counts, nil
+}
+
 func (g *GameHostClient) GetView(ctx context.Context, id, playerID string) (json.RawMessage, error) {
 	body, _, err := g.do(ctx, http.MethodGet, "/matches/"+id+"/view?playerId="+playerID, nil)
 	return body, err

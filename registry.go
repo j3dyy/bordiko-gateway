@@ -60,6 +60,65 @@ func (r *RegistryClient) Catalog(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
+// RegGame is one game as the registry describes it (manifest metadata + rating
+// aggregates). The gateway enriches this with play/live counts for the catalog.
+type RegGame struct {
+	GameID      string  `json:"gameId"`
+	DisplayName string  `json:"displayName"`
+	Board       string  `json:"board"`
+	MinPlayers  int     `json:"minPlayers"`
+	MaxPlayers  int     `json:"maxPlayers"`
+	Rating      float64 `json:"rating"`
+	RatingCount int     `json:"ratingCount"`
+}
+
+// CatalogFull returns the registry's published games with metadata + ratings.
+func (r *RegistryClient) CatalogFull(ctx context.Context) ([]RegGame, error) {
+	if !r.configured() {
+		return nil, nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.base+"/games", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := r.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("registry catalog: %d", resp.StatusCode)
+	}
+	var wrap struct {
+		Games []RegGame `json:"games"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&wrap); err != nil {
+		return nil, err
+	}
+	return wrap.Games, nil
+}
+
+// Rate submits a user's star rating for a game to the registry and returns its
+// status + body verbatim.
+func (r *RegistryClient) Rate(ctx context.Context, gameID, userID string, stars int) (int, []byte, error) {
+	if !r.configured() {
+		return 0, nil, fmt.Errorf("registry not configured")
+	}
+	payload, _ := json.Marshal(map[string]any{"userId": userID, "stars": stars})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.base+"/games/"+gameID+"/rate", bytes.NewReader(payload))
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := r.hc.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	return resp.StatusCode, data, err
+}
+
 // Publish forwards a raw publish package (the JSON body from tools/publish.mjs)
 // to the registry and returns the registry's status code and response body
 // verbatim, so the CLI sees the registry's own validation errors.

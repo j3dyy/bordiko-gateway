@@ -53,6 +53,11 @@ func (gw *Gateway) Routes() http.Handler {
 	// Catalog (public read) — union of the registry's published games and the
 	// game-host's loaded games, so the browse list reflects the marketplace.
 	mux.HandleFunc("GET /api/games", gw.handleGames)
+	// Rich catalog (public read) — per-game metadata + real rating/plays/live,
+	// consumed by the Discover screen.
+	mux.HandleFunc("GET /api/catalog", gw.handleCatalog)
+	// Rate a game (login required) — the gateway injects the trusted user id.
+	mux.HandleFunc("POST /api/games/{id}/rate", gw.requireAuth(gw.handleRate))
 
 	// Publish (admin-guarded) — proxies a game package to the internal registry
 	// so developers can publish over HTTPS while the registry stays private.
@@ -215,6 +220,74 @@ func (gw *Gateway) handleGames(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(ids)
 	writeJSON(w, http.StatusOK, map[string]any{"games": ids})
+}
+
+// catalogGame is one row of the Discover catalog: registry metadata + rating,
+// enriched with real play counts (game-host) and live tables (lobby).
+type catalogGame struct {
+	ID          string  `json:"id"`
+	DisplayName string  `json:"displayName"`
+	MinPlayers  int     `json:"minPlayers"`
+	MaxPlayers  int     `json:"maxPlayers"`
+	Board       string  `json:"board"`
+	Rating      float64 `json:"rating"`
+	RatingCount int     `json:"ratingCount"`
+	Plays       int     `json:"plays"`
+	Live        int     `json:"live"`
+}
+
+// handleCatalog builds the marketplace catalog from real data: the registry's
+// published games + ratings, game-host match counts (plays), and open lobbies
+// per game (live). Every source is best-effort so the list degrades gracefully.
+func (gw *Gateway) handleCatalog(w http.ResponseWriter, r *http.Request) {
+	reg, _ := gw.reg.CatalogFull(r.Context())
+	plays, _ := gw.gh.Stats(r.Context())
+	live := map[string]int{}
+	for _, l := range gw.lobby.ListOpen() {
+		live[l.GameID]++
+	}
+	seen := map[string]bool{}
+	out := []catalogGame{}
+	for _, g := range reg {
+		seen[g.GameID] = true
+		out = append(out, catalogGame{
+			ID: g.GameID, DisplayName: g.DisplayName, MinPlayers: g.MinPlayers, MaxPlayers: g.MaxPlayers,
+			Board: g.Board, Rating: g.Rating, RatingCount: g.RatingCount,
+			Plays: plays[g.GameID], Live: live[g.GameID],
+		})
+	}
+	// Games the game-host has loaded but the registry doesn't list (e.g. local
+	// dist in dev) still appear.
+	if gh, err := gw.gh.ListGames(r.Context()); err == nil {
+		for _, id := range gh {
+			if !seen[id] {
+				seen[id] = true
+				out = append(out, catalogGame{ID: id, Plays: plays[id], Live: live[id]})
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	writeJSON(w, http.StatusOK, map[string]any{"games": out})
+}
+
+// handleRate forwards a signed-in user's star rating to the registry, injecting
+// the trusted user id from the session (the client only sends the star count).
+func (gw *Gateway) handleRate(w http.ResponseWriter, r *http.Request, u *sessionClaims) {
+	var body struct {
+		Stars int `json:"stars"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Stars < 1 || body.Stars > 5 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_request", "message": "stars must be 1-5"})
+		return
+	}
+	status, resp, err := gw.reg.Rate(r.Context(), r.PathValue("id"), u.Sub, body.Stars)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "registry_unavailable", "message": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(resp)
 }
 
 // handlePublish proxies a game package to the internal registry. Guarded by an
