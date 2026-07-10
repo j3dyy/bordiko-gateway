@@ -43,6 +43,26 @@ type ApplyResp struct {
 	Result        json.RawMessage `json:"result"`
 }
 
+// ListGames returns the game ids the game-host currently has loaded (local dist
+// at startup plus any fetched on demand). Best-effort; the gateway unions this
+// with the registry catalog for the browse list.
+func (g *GameHostClient) ListGames(ctx context.Context) ([]string, error) {
+	body, status, err := g.do(ctx, http.MethodGet, "/games", nil)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("game-host games: %d %s", status, truncate(body))
+	}
+	var wrap struct {
+		Games []string `json:"games"`
+	}
+	if err := json.Unmarshal(body, &wrap); err != nil {
+		return nil, err
+	}
+	return wrap.Games, nil
+}
+
 func (g *GameHostClient) GetMatch(ctx context.Context, id string) (*MatchMeta, error) {
 	body, _, err := g.do(ctx, http.MethodGet, "/matches/"+id, nil)
 	if err != nil {

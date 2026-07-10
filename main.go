@@ -10,6 +10,8 @@
 //
 //	GATEWAY_ADDR      listen address                         (default ":8080")
 //	GAME_HOST_URL     authoritative game-host base           (default "http://localhost:8081")
+//	REGISTRY_URL      internal marketplace registry base     (default "http://localhost:8082")
+//	ADMIN_TOKEN       shared secret enabling POST /api/publish (unset = publishing disabled)
 //	DATABASE_URL      Postgres DSN for accounts (else in-memory)
 //	SESSION_SECRET    HMAC key for session cookies (else ephemeral)
 //	PUBLIC_URL        gateway's public base for OAuth redirect_uri (default "http://localhost:8080")
@@ -33,6 +35,8 @@ func main() {
 	ctx := context.Background()
 	ghURL := env("GAME_HOST_URL", "http://localhost:8081")
 	gh := NewGameHostClient(ghURL)
+	reg := NewRegistryClient(env("REGISTRY_URL", "http://localhost:8082"))
+	adminToken := os.Getenv("ADMIN_TOKEN")
 
 	users, err := openUserStore(ctx)
 	if err != nil {
@@ -46,10 +50,11 @@ func main() {
 
 	hub := NewHub(gh, auth)
 	lobby := NewLobbyManager(gh)
-	gw := NewGateway(hub, gh, auth, lobby, ghURL, origins)
+	gw := NewGateway(hub, gh, reg, auth, lobby, ghURL, adminToken, origins)
 
 	addr := env("GATEWAY_ADDR", ":8080")
-	log.Printf("bordiko gateway listening on %s → game-host %s (origins %v)", addr, ghURL, origins)
+	log.Printf("bordiko gateway listening on %s → game-host %s (origins %v; publish %s)",
+		addr, ghURL, origins, map[bool]string{true: "enabled", false: "disabled (set ADMIN_TOKEN)"}[adminToken != ""])
 	if err := http.ListenAndServe(addr, gw.Routes()); err != nil {
 		log.Fatalf("gateway failed: %v", err)
 	}

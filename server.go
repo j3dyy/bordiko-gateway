@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -17,14 +19,16 @@ import (
 type Gateway struct {
 	hub            *Hub
 	gh             *GameHostClient
+	reg            *RegistryClient
 	auth           *Auth
 	lobby          *LobbyManager
 	ghURL          string
+	adminToken     string
 	allowedOrigins []string
 }
 
-func NewGateway(hub *Hub, gh *GameHostClient, auth *Auth, lobby *LobbyManager, ghURL string, allowedOrigins []string) *Gateway {
-	return &Gateway{hub: hub, gh: gh, auth: auth, lobby: lobby, ghURL: ghURL, allowedOrigins: allowedOrigins}
+func NewGateway(hub *Hub, gh *GameHostClient, reg *RegistryClient, auth *Auth, lobby *LobbyManager, ghURL, adminToken string, allowedOrigins []string) *Gateway {
+	return &Gateway{hub: hub, gh: gh, reg: reg, auth: auth, lobby: lobby, ghURL: ghURL, adminToken: adminToken, allowedOrigins: allowedOrigins}
 }
 
 func (gw *Gateway) Routes() http.Handler {
@@ -46,8 +50,16 @@ func (gw *Gateway) Routes() http.Handler {
 	// Leaderboard (public read) — enriched with display names.
 	mux.HandleFunc("GET /api/leaderboard", gw.handleLeaderboard)
 
-	// Everything else under /api/ (games list, match summary, view, legal, moves)
-	// is proxied straight through to the game-host.
+	// Catalog (public read) — union of the registry's published games and the
+	// game-host's loaded games, so the browse list reflects the marketplace.
+	mux.HandleFunc("GET /api/games", gw.handleGames)
+
+	// Publish (admin-guarded) — proxies a game package to the internal registry
+	// so developers can publish over HTTPS while the registry stays private.
+	mux.HandleFunc("POST /api/publish", gw.handlePublish)
+
+	// Everything else under /api/ (match summary, view, legal, moves) is proxied
+	// straight through to the game-host.
 	target, _ := url.Parse(gw.ghURL)
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	mux.Handle("/api/", http.StripPrefix("/api", proxy))
@@ -177,6 +189,61 @@ func (gw *Gateway) handleLeaderboard(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Rating > rows[j].Rating })
 	writeJSON(w, http.StatusOK, map[string]any{"gameId": gameID, "entries": rows})
+}
+
+/* --------------------------------- catalog -------------------------------- */
+
+// handleGames returns the browse catalog: the union of games published to the
+// registry and games the game-host already has loaded. Either source failing is
+// non-fatal — we return whatever we can reach.
+func (gw *Gateway) handleGames(w http.ResponseWriter, r *http.Request) {
+	seen := map[string]bool{}
+	ids := []string{}
+	add := func(list []string) {
+		for _, id := range list {
+			if id != "" && !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+			}
+		}
+	}
+	if reg, err := gw.reg.Catalog(r.Context()); err == nil {
+		add(reg)
+	}
+	if gh, err := gw.gh.ListGames(r.Context()); err == nil {
+		add(gh)
+	}
+	sort.Strings(ids)
+	writeJSON(w, http.StatusOK, map[string]any{"games": ids})
+}
+
+// handlePublish proxies a game package to the internal registry. Guarded by an
+// admin token (X-Admin-Token header) so the registry stays private while
+// developers publish over HTTPS via the gateway. Publishing is disabled until
+// ADMIN_TOKEN is set on the gateway.
+func (gw *Gateway) handlePublish(w http.ResponseWriter, r *http.Request) {
+	if gw.adminToken == "" {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "publish_disabled", "message": "ADMIN_TOKEN not set on gateway"})
+		return
+	}
+	got := r.Header.Get("X-Admin-Token")
+	if subtle.ConstantTimeCompare([]byte(got), []byte(gw.adminToken)) != 1 {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<20))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_request", "message": "read body"})
+		return
+	}
+	status, respBody, err := gw.reg.Publish(r.Context(), body)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "registry_unavailable", "message": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(respBody)
 }
 
 /* ---------------------------------- CORS ---------------------------------- */
