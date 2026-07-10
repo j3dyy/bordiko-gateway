@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -117,6 +118,33 @@ func (r *RegistryClient) Rate(ctx context.Context, gameID, userID string, stars 
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
 	return resp.StatusCode, data, err
+}
+
+// MyRating returns the user's own stars for a game (0 if unrated / unavailable).
+func (r *RegistryClient) MyRating(ctx context.Context, gameID, userID string) (int, error) {
+	if !r.configured() {
+		return 0, nil
+	}
+	u := r.base + "/games/" + url.PathEscape(gameID) + "/rating?userId=" + url.QueryEscape(userID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := r.hc.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("registry rating: %d", resp.StatusCode)
+	}
+	var wrap struct {
+		Stars int `json:"stars"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&wrap); err != nil {
+		return 0, err
+	}
+	return wrap.Stars, nil
 }
 
 // Publish forwards a raw publish package (the JSON body from tools/publish.mjs)

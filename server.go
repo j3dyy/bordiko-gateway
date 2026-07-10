@@ -58,6 +58,8 @@ func (gw *Gateway) Routes() http.Handler {
 	mux.HandleFunc("GET /api/catalog", gw.handleCatalog)
 	// Rate a game (login required) — the gateway injects the trusted user id.
 	mux.HandleFunc("POST /api/games/{id}/rate", gw.requireAuth(gw.handleRate))
+	// The signed-in user's own rating for a game, to pre-fill the rater.
+	mux.HandleFunc("GET /api/games/{id}/my-rating", gw.requireAuth(gw.handleMyRating))
 
 	// Publish (admin-guarded) — proxies a game package to the internal registry
 	// so developers can publish over HTTPS while the registry stays private.
@@ -305,6 +307,15 @@ func (gw *Gateway) handleRate(w http.ResponseWriter, r *http.Request, u *session
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(resp)
+}
+
+// handleMyRating returns the signed-in user's own stars for a game (0 if unrated).
+func (gw *Gateway) handleMyRating(w http.ResponseWriter, r *http.Request, u *sessionClaims) {
+	stars, err := gw.reg.MyRating(r.Context(), r.PathValue("id"), u.Sub)
+	if err != nil {
+		stars = 0
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"stars": stars})
 }
 
 // handlePublish proxies a game package to the internal registry. Guarded by an
