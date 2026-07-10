@@ -107,8 +107,22 @@ func (gw *Gateway) createLobby(w http.ResponseWriter, r *http.Request, u *sessio
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_request", "message": "gameId required"})
 		return
 	}
+	if gw.blockIfInGame(w, r, u) {
+		return
+	}
 	l := gw.lobby.Create(LobbyPlayer{ID: u.Sub, Name: u.Name}, req.GameID, req.Seats)
 	writeJSON(w, http.StatusCreated, l)
+}
+
+// blockIfInGame rejects a create/join with 409 when the user is already in an
+// unfinished match, returning the active match so the client can offer "resume".
+func (gw *Gateway) blockIfInGame(w http.ResponseWriter, r *http.Request, u *sessionClaims) bool {
+	mid, gid, active, err := gw.gh.ActiveMatch(r.Context(), u.Sub)
+	if err == nil && active {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "active_match", "matchId": mid, "gameId": gid})
+		return true
+	}
+	return false
 }
 
 func (gw *Gateway) getLobby(w http.ResponseWriter, r *http.Request, _ *sessionClaims) {
@@ -121,6 +135,9 @@ func (gw *Gateway) getLobby(w http.ResponseWriter, r *http.Request, _ *sessionCl
 }
 
 func (gw *Gateway) joinLobby(w http.ResponseWriter, r *http.Request, u *sessionClaims) {
+	if gw.blockIfInGame(w, r, u) {
+		return
+	}
 	l, err := gw.lobby.Join(r.Context(), r.PathValue("id"), LobbyPlayer{ID: u.Sub, Name: u.Name})
 	if err != nil {
 		switch {

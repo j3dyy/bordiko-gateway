@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"strings"
 	"sync"
 )
 
@@ -77,6 +78,26 @@ func (h *Hub) handleMove(ctx context.Context, c *Client, cm clientMessage) {
 		"t": "move_ok", "matchId": c.matchID, "clientMoveId": cm.ClientMoveID, "moveCount": res.MoveCount,
 	}))
 	h.broadcastState(ctx, c.matchID, res.Events)
+}
+
+// handleChat relays a player's chat message to everyone in the match room
+// (including the sender, so their own line echoes). Chat is ephemeral — the hub
+// routes it and keeps no history. The name/id come from the authenticated
+// session, so a client can't spoof another player.
+func (h *Hub) handleChat(c *Client, cm clientMessage) {
+	text := strings.TrimSpace(cm.Text)
+	if text == "" {
+		return
+	}
+	if len(text) > 500 {
+		text = text[:500]
+	}
+	msg := mustJSON(map[string]any{
+		"t": "chat", "matchId": c.matchID, "from": c.playerID, "name": c.playerName, "text": text, "ts": cm.TS,
+	})
+	for _, cl := range h.clientsIn(c.matchID) {
+		cl.trySend(msg)
+	}
 }
 
 // broadcastState sends every client in the room its own redacted view (plus the

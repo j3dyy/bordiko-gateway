@@ -55,13 +55,14 @@ const (
 
 // Client is one WebSocket connection: a single player watching one match.
 type Client struct {
-	hub       *Hub
-	conn      *websocket.Conn
-	send      chan []byte
-	matchID   string
-	playerID  string
-	done      chan struct{}
-	closeOnce sync.Once
+	hub        *Hub
+	conn       *websocket.Conn
+	send       chan []byte
+	matchID    string
+	playerID   string
+	playerName string
+	done       chan struct{}
+	closeOnce  sync.Once
 }
 
 // clientMessage is the inbound wire message (see packages/shared/protocol.ts).
@@ -72,7 +73,8 @@ type clientMessage struct {
 		Type    string          `json:"type"`
 		Payload json.RawMessage `json:"payload"`
 	} `json:"move"`
-	TS int64 `json:"ts"`
+	Text string `json:"text"` // chat message body
+	TS   int64  `json:"ts"`
 }
 
 func (h *Hub) serveWS(w http.ResponseWriter, r *http.Request) {
@@ -107,12 +109,13 @@ func (h *Hub) serveWS(w http.ResponseWriter, r *http.Request) {
 		return // Upgrade already wrote the error
 	}
 	c := &Client{
-		hub:      h,
-		conn:     conn,
-		send:     make(chan []byte, 32),
-		matchID:  matchID,
-		playerID: playerID,
-		done:     make(chan struct{}),
+		hub:        h,
+		conn:       conn,
+		send:       make(chan []byte, 32),
+		matchID:    matchID,
+		playerID:   playerID,
+		playerName: claims.Name,
+		done:       make(chan struct{}),
 	}
 	h.add(c)
 	go c.writePump()
@@ -159,6 +162,8 @@ func (c *Client) readPump() {
 		switch cm.T {
 		case "move":
 			c.hub.handleMove(ctx, c, cm)
+		case "chat":
+			c.hub.handleChat(c, cm)
 		case "ping":
 			c.trySend(mustJSON(map[string]any{"t": "pong", "ts": cm.TS}))
 		case "leave":

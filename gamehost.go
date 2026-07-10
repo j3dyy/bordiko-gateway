@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -138,6 +139,27 @@ func (g *GameHostClient) ApplyMove(ctx context.Context, id, playerID, mtype stri
 		return nil, status, fmt.Errorf("decode apply: %w", err)
 	}
 	return &res, status, nil
+}
+
+// ActiveMatch reports the unfinished match a player is currently in, if any —
+// used by the lobby to enforce one game at a time and to offer "resume".
+func (g *GameHostClient) ActiveMatch(ctx context.Context, playerID string) (matchID, gameID string, active bool, err error) {
+	body, status, err := g.do(ctx, http.MethodGet, "/players/"+url.PathEscape(playerID)+"/active", nil)
+	if err != nil {
+		return "", "", false, err
+	}
+	if status != http.StatusOK {
+		return "", "", false, fmt.Errorf("game-host active: %d", status)
+	}
+	var wrap struct {
+		Active  bool   `json:"active"`
+		MatchID string `json:"matchId"`
+		GameID  string `json:"gameId"`
+	}
+	if err := json.Unmarshal(body, &wrap); err != nil {
+		return "", "", false, err
+	}
+	return wrap.MatchID, wrap.GameID, wrap.Active, nil
 }
 
 // Stats returns per-game match counts (the "plays" metric) from the game-host.
