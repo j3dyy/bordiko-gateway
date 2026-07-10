@@ -77,9 +77,14 @@ func (g *GameHostClient) GetMatch(ctx context.Context, id string) (*MatchMeta, e
 }
 
 // CreateMatch asks the game-host to set up a new match with the given players
-// (user ids). Used by the lobby once a pending match fills up.
-func (g *GameHostClient) CreateMatch(ctx context.Context, gameID string, players []string) (*MatchMeta, error) {
-	reqBody, _ := json.Marshal(map[string]any{"gameId": gameID, "players": players})
+// (user ids, in seat order) and optional table config (mode + teams). Used by
+// the lobby when the host starts a filled table.
+func (g *GameHostClient) CreateMatch(ctx context.Context, gameID string, players []string, config json.RawMessage) (*MatchMeta, error) {
+	payload := map[string]any{"gameId": gameID, "players": players}
+	if len(config) > 0 {
+		payload["config"] = config
+	}
+	reqBody, _ := json.Marshal(payload)
 	body, status, err := g.do(ctx, http.MethodPost, "/matches", reqBody)
 	if err != nil {
 		return nil, err

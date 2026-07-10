@@ -45,6 +45,9 @@ func (gw *Gateway) Routes() http.Handler {
 	mux.HandleFunc("POST /api/lobby", gw.requireAuth(gw.createLobby))
 	mux.HandleFunc("GET /api/lobby/{id}", gw.requireAuth(gw.getLobby))
 	mux.HandleFunc("POST /api/lobby/{id}/join", gw.requireAuth(gw.joinLobby))
+	mux.HandleFunc("POST /api/lobby/{id}/sit", gw.requireAuth(gw.sitLobby))
+	mux.HandleFunc("POST /api/lobby/{id}/stand", gw.requireAuth(gw.standLobby))
+	mux.HandleFunc("POST /api/lobby/{id}/start", gw.requireAuth(gw.startLobby))
 	mux.HandleFunc("DELETE /api/lobby/{id}", gw.requireAuth(gw.cancelLobby))
 
 	// Leaderboard (public read) — enriched with display names.
@@ -104,6 +107,7 @@ func (gw *Gateway) createLobby(w http.ResponseWriter, r *http.Request, u *sessio
 	var req struct {
 		GameID string `json:"gameId"`
 		Seats  int    `json:"seats"`
+		Mode   string `json:"mode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.GameID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_request", "message": "gameId required"})
@@ -112,7 +116,7 @@ func (gw *Gateway) createLobby(w http.ResponseWriter, r *http.Request, u *sessio
 	if gw.blockIfInGame(w, r, u) {
 		return
 	}
-	l := gw.lobby.Create(LobbyPlayer{ID: u.Sub, Name: u.Name}, req.GameID, req.Seats)
+	l := gw.lobby.Create(LobbyPlayer{ID: u.Sub, Name: u.Name}, req.GameID, req.Seats, req.Mode)
 	writeJSON(w, http.StatusCreated, l)
 }
 
@@ -141,18 +145,61 @@ func (gw *Gateway) joinLobby(w http.ResponseWriter, r *http.Request, u *sessionC
 		return
 	}
 	l, err := gw.lobby.Join(r.Context(), r.PathValue("id"), LobbyPlayer{ID: u.Sub, Name: u.Name})
-	if err != nil {
-		switch {
-		case errors.Is(err, ErrLobbyNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
-		case errors.Is(err, ErrLobbyFull):
-			writeJSON(w, http.StatusConflict, map[string]any{"error": "lobby_full"})
-		default:
-			writeJSON(w, http.StatusBadGateway, map[string]any{"error": "start_failed", "message": err.Error()})
-		}
+	gw.writeLobby(w, l, err)
+}
+
+// sitLobby seats the player in a specific seat (choosing their partnership in
+// teams mode). Blocked if the player is already in a live match.
+func (gw *Gateway) sitLobby(w http.ResponseWriter, r *http.Request, u *sessionClaims) {
+	if gw.blockIfInGame(w, r, u) {
 		return
 	}
-	writeJSON(w, http.StatusOK, l)
+	var req struct {
+		Seat int `json:"seat"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_request", "message": "seat required"})
+		return
+	}
+	l, err := gw.lobby.Sit(r.PathValue("id"), LobbyPlayer{ID: u.Sub, Name: u.Name}, req.Seat)
+	gw.writeLobby(w, l, err)
+}
+
+// standLobby vacates the player's seat.
+func (gw *Gateway) standLobby(w http.ResponseWriter, r *http.Request, u *sessionClaims) {
+	l, err := gw.lobby.Stand(r.PathValue("id"), u.Sub)
+	gw.writeLobby(w, l, err)
+}
+
+// startLobby begins the match — host only, once every seat is filled.
+func (gw *Gateway) startLobby(w http.ResponseWriter, r *http.Request, u *sessionClaims) {
+	l, err := gw.lobby.Start(r.Context(), r.PathValue("id"), u.Sub)
+	gw.writeLobby(w, l, err)
+}
+
+// writeLobby maps the lobby domain errors onto HTTP responses (or returns the
+// updated lobby on success).
+func (gw *Gateway) writeLobby(w http.ResponseWriter, l *Lobby, err error) {
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, l)
+	case errors.Is(err, ErrLobbyNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
+	case errors.Is(err, ErrNotHost):
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "not_host"})
+	case errors.Is(err, ErrBadSeat):
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_seat"})
+	case errors.Is(err, ErrSeatTaken):
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "seat_taken"})
+	case errors.Is(err, ErrNotSeated):
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "not_seated"})
+	case errors.Is(err, ErrNotReady):
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "not_ready"})
+	case errors.Is(err, ErrLobbyFull), errors.Is(err, ErrLobbyStarted):
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "lobby_unavailable"})
+	default:
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "start_failed", "message": err.Error()})
+	}
 }
 
 func (gw *Gateway) cancelLobby(w http.ResponseWriter, r *http.Request, u *sessionClaims) {
