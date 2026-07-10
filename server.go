@@ -105,9 +105,11 @@ func (gw *Gateway) listLobbies(w http.ResponseWriter, _ *http.Request, _ *sessio
 
 func (gw *Gateway) createLobby(w http.ResponseWriter, r *http.Request, u *sessionClaims) {
 	var req struct {
-		GameID string `json:"gameId"`
-		Seats  int    `json:"seats"`
-		Mode   string `json:"mode"`
+		GameID     string `json:"gameId"`
+		Seats      int    `json:"seats"`
+		Mode       string `json:"mode"`
+		Visibility string `json:"visibility"`
+		Password   string `json:"password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.GameID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_request", "message": "gameId required"})
@@ -116,7 +118,7 @@ func (gw *Gateway) createLobby(w http.ResponseWriter, r *http.Request, u *sessio
 	if gw.blockIfInGame(w, r, u) {
 		return
 	}
-	l := gw.lobby.Create(LobbyPlayer{ID: u.Sub, Name: u.Name}, req.GameID, req.Seats, req.Mode)
+	l := gw.lobby.Create(LobbyPlayer{ID: u.Sub, Name: u.Name}, req.GameID, req.Seats, req.Mode, req.Visibility, req.Password)
 	writeJSON(w, http.StatusCreated, l)
 }
 
@@ -144,7 +146,11 @@ func (gw *Gateway) joinLobby(w http.ResponseWriter, r *http.Request, u *sessionC
 	if gw.blockIfInGame(w, r, u) {
 		return
 	}
-	l, err := gw.lobby.Join(r.Context(), r.PathValue("id"), LobbyPlayer{ID: u.Sub, Name: u.Name})
+	var req struct {
+		Password string `json:"password"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req) // body is optional (public tables)
+	l, err := gw.lobby.Join(r.Context(), r.PathValue("id"), LobbyPlayer{ID: u.Sub, Name: u.Name}, req.Password)
 	gw.writeLobby(w, l, err)
 }
 
@@ -155,13 +161,14 @@ func (gw *Gateway) sitLobby(w http.ResponseWriter, r *http.Request, u *sessionCl
 		return
 	}
 	var req struct {
-		Seat int `json:"seat"`
+		Seat     int    `json:"seat"`
+		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_request", "message": "seat required"})
 		return
 	}
-	l, err := gw.lobby.Sit(r.PathValue("id"), LobbyPlayer{ID: u.Sub, Name: u.Name}, req.Seat)
+	l, err := gw.lobby.Sit(r.PathValue("id"), LobbyPlayer{ID: u.Sub, Name: u.Name}, req.Seat, req.Password)
 	gw.writeLobby(w, l, err)
 }
 
@@ -193,6 +200,8 @@ func (gw *Gateway) writeLobby(w http.ResponseWriter, l *Lobby, err error) {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "seat_taken"})
 	case errors.Is(err, ErrNotSeated):
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "not_seated"})
+	case errors.Is(err, ErrWrongPassword):
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "wrong_password"})
 	case errors.Is(err, ErrNotReady):
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "not_ready"})
 	case errors.Is(err, ErrLobbyFull), errors.Is(err, ErrLobbyStarted):

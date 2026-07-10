@@ -35,6 +35,7 @@ var (
 	ErrSeatTaken     = errors.New("that seat is taken")
 	ErrNotSeated     = errors.New("you are not seated at this table")
 	ErrNotReady      = errors.New("every seat must be filled to start")
+	ErrWrongPassword = errors.New("wrong table password")
 )
 
 type LobbyPlayer struct {
@@ -52,14 +53,34 @@ type Seat struct {
 }
 
 type Lobby struct {
-	ID        string    `json:"id"`
-	GameID    string    `json:"gameId"`
-	Host      string    `json:"host"`
-	Mode      string    `json:"mode"` // "solo" | "teams"
-	Seats     []Seat    `json:"seats"`
-	MatchID   string    `json:"matchId,omitempty"`
-	Status    string    `json:"status"` // "open" | "started"
-	CreatedAt time.Time `json:"createdAt"`
+	ID          string    `json:"id"`
+	GameID      string    `json:"gameId"`
+	Host        string    `json:"host"`
+	Mode        string    `json:"mode"`       // "solo" | "teams"
+	Visibility  string    `json:"visibility"` // "public" | "private"
+	HasPassword bool      `json:"hasPassword"`
+	Seats       []Seat    `json:"seats"`
+	MatchID     string    `json:"matchId,omitempty"`
+	Status      string    `json:"status"` // "open" | "started"
+	CreatedAt   time.Time `json:"createdAt"`
+	// password is unexported → never serialized; checked server-side when a
+	// non-host, not-yet-seated player tries to sit at a private table.
+	password string
+}
+
+// gatePassword enforces a private table's password. The host and anyone already
+// seated are exempt (so they can rearrange seats freely).
+func (l *Lobby) gatePassword(playerID, password string) error {
+	if l.Visibility != "private" || l.password == "" {
+		return nil
+	}
+	if playerID == l.Host || l.hasPlayer(playerID) {
+		return nil
+	}
+	if password != l.password {
+		return ErrWrongPassword
+	}
+	return nil
 }
 
 // teamOf returns the team a seat belongs to. In "teams" mode partners sit
@@ -145,7 +166,7 @@ func NewLobbyManager(gh *GameHostClient) *LobbyManager {
 
 // Create opens a new table with the host already seated at seat 0. Teams mode
 // requires an even seat count of at least 4; anything else falls back to solo.
-func (m *LobbyManager) Create(host LobbyPlayer, gameID string, seatCount int, mode string) *Lobby {
+func (m *LobbyManager) Create(host LobbyPlayer, gameID string, seatCount int, mode, visibility, password string) *Lobby {
 	if seatCount < 2 {
 		seatCount = 2
 	}
@@ -158,6 +179,13 @@ func (m *LobbyManager) Create(host LobbyPlayer, gameID string, seatCount int, mo
 	if mode == "teams" && (seatCount < 4 || seatCount%2 != 0) {
 		mode = "solo"
 	}
+	// A password implies a private table; otherwise default to public.
+	if visibility != "private" {
+		visibility = "public"
+	}
+	if password != "" {
+		visibility = "private"
+	}
 	seats := make([]Seat, seatCount)
 	for i := range seats {
 		seats[i] = Seat{Index: i, Team: teamOf(i, mode)}
@@ -168,25 +196,29 @@ func (m *LobbyManager) Create(host LobbyPlayer, gameID string, seatCount int, mo
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	l := &Lobby{
-		ID:        hex.EncodeToString(randID(6)),
-		GameID:    gameID,
-		Host:      host.ID,
-		Mode:      mode,
-		Seats:     seats,
-		Status:    "open",
-		CreatedAt: time.Now(),
+		ID:          hex.EncodeToString(randID(6)),
+		GameID:      gameID,
+		Host:        host.ID,
+		Mode:        mode,
+		Visibility:  visibility,
+		HasPassword: password != "",
+		Seats:       seats,
+		Status:      "open",
+		CreatedAt:   time.Now(),
+		password:    password,
 	}
 	m.lobbies[l.ID] = l
 	return cloneLobby(l)
 }
 
-// ListOpen returns tables still waiting to start, newest first.
+// ListOpen returns PUBLIC tables still waiting to start, newest first. Private
+// tables are hidden — they are reachable only by their shareable link/id.
 func (m *LobbyManager) ListOpen() []Lobby {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := []Lobby{}
 	for _, l := range m.lobbies {
-		if l.Status == "open" {
+		if l.Status == "open" && l.Visibility != "private" {
 			out = append(out, *cloneLobby(l))
 		}
 	}
@@ -207,7 +239,7 @@ func (m *LobbyManager) Get(id string) (*Lobby, error) {
 // Sit seats a player in a specific empty seat (moving them from any seat they
 // already hold). Choosing a seat is how a player joins the table — and, in teams
 // mode, how they choose their partnership.
-func (m *LobbyManager) Sit(id string, player LobbyPlayer, seatIndex int) (*Lobby, error) {
+func (m *LobbyManager) Sit(id string, player LobbyPlayer, seatIndex int, password string) (*Lobby, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	l, ok := m.lobbies[id]
@@ -216,6 +248,9 @@ func (m *LobbyManager) Sit(id string, player LobbyPlayer, seatIndex int) (*Lobby
 	}
 	if l.Status != "open" {
 		return nil, ErrLobbyStarted
+	}
+	if err := l.gatePassword(player.ID, password); err != nil {
+		return nil, err
 	}
 	if seatIndex < 0 || seatIndex >= len(l.Seats) {
 		return nil, ErrBadSeat
@@ -236,7 +271,7 @@ func (m *LobbyManager) Sit(id string, player LobbyPlayer, seatIndex int) (*Lobby
 
 // Join seats a player in the first open seat (the quick-join path used from the
 // "Live now" list). Re-joining an already-seated player is a no-op.
-func (m *LobbyManager) Join(_ context.Context, id string, player LobbyPlayer) (*Lobby, error) {
+func (m *LobbyManager) Join(_ context.Context, id string, player LobbyPlayer, password string) (*Lobby, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	l, ok := m.lobbies[id]
@@ -248,6 +283,9 @@ func (m *LobbyManager) Join(_ context.Context, id string, player LobbyPlayer) (*
 	}
 	if l.Status != "open" {
 		return nil, ErrLobbyStarted
+	}
+	if err := l.gatePassword(player.ID, password); err != nil {
+		return nil, err
 	}
 	idx := -1
 	for i := range l.Seats {
