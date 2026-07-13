@@ -137,7 +137,7 @@ func (h *Hub) broadcastState(ctx context.Context, matchID string, events json.Ra
 		return
 	}
 	deadline := h.armTurn(matchID, meta)
-	names := h.auth.DisplayNames(ctx, meta.Players)
+	names := h.resolveNames(ctx, matchID, meta.Players)
 	hasEvents := len(events) > 0 && string(events) != "null"
 	for _, c := range h.clientsIn(matchID) {
 		if msg, err := h.stateMessage(ctx, matchID, c, meta, deadline, names); err == nil {
@@ -149,6 +149,20 @@ func (h *Hub) broadcastState(ctx context.Context, matchID string, events json.Ra
 			}))
 		}
 	}
+}
+
+// resolveNames maps the match's player ids to display names: the durable store
+// names first, then overlaid with the names of currently-connected clients (from
+// their session), so a name still shows even if the account store is empty (e.g.
+// in-memory + a recent redeploy).
+func (h *Hub) resolveNames(ctx context.Context, matchID string, players []string) map[string]string {
+	names := h.auth.DisplayNames(ctx, players)
+	for _, c := range h.clientsIn(matchID) {
+		if c.playerName != "" {
+			names[c.playerID] = c.playerName
+		}
+	}
+	return names
 }
 
 // stateMessage builds the redacted "state" message for one client: the

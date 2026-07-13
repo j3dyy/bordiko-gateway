@@ -80,9 +80,17 @@ func (a *Auth) RegisterRoutes(mux *http.ServeMux) {
 }
 
 func (a *Auth) handleProviders(w http.ResponseWriter, _ *http.Request) {
+	// accounts = which user store backs display names: "postgres" (durable) or
+	// "memory" (wiped on every redeploy → names fall back to raw ids). Diagnostic
+	// for the "board/leaderboard shows google:<id>" symptom.
+	store := "memory"
+	if _, ok := a.users.(*PostgresUserStore); ok {
+		store = "postgres"
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"providers": a.providerNames(),
 		"dev":       a.devEnabled,
+		"accounts":  store,
 	})
 }
 
