@@ -6,20 +6,41 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Hub tracks which WebSocket clients are watching which match ("rooms") and fans
 // out per-player redacted state after every accepted move. It holds no game
-// state — the game-host is authoritative; the hub only routes.
+// state — the game-host is authoritative; the hub only routes. It also runs a
+// per-match TURN TIMER: when a turn opens, a timer is armed; if the acting
+// player doesn't move before it fires, the hub auto-plays a safe (first legal)
+// move on their behalf so a slow or absent player can't stall the table.
 type Hub struct {
 	mu    sync.RWMutex
 	rooms map[string]map[*Client]struct{}
 	gh    *GameHostClient
 	auth  *Auth
+
+	turnLimit time.Duration
+	tmu       sync.Mutex
+	turns     map[string]*turnState
 }
 
-func NewHub(gh *GameHostClient, auth *Auth) *Hub {
-	return &Hub{rooms: make(map[string]map[*Client]struct{}), gh: gh, auth: auth}
+// turnState is the live timer for one match's current turn.
+type turnState struct {
+	timer     *time.Timer
+	moveCount int   // the turn this timer belongs to (guards against stale fires)
+	deadline  int64 // unix ms, surfaced to clients for a countdown
+}
+
+func NewHub(gh *GameHostClient, auth *Auth, turnLimit time.Duration) *Hub {
+	return &Hub{
+		rooms:     make(map[string]map[*Client]struct{}),
+		gh:        gh,
+		auth:      auth,
+		turnLimit: turnLimit,
+		turns:     make(map[string]*turnState),
+	}
 }
 
 func (h *Hub) add(c *Client) {
@@ -35,12 +56,19 @@ func (h *Hub) add(c *Client) {
 
 func (h *Hub) remove(c *Client) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	empty := false
 	if room := h.rooms[c.matchID]; room != nil {
 		delete(room, c)
 		if len(room) == 0 {
 			delete(h.rooms, c.matchID)
+			empty = true
 		}
+	}
+	h.mu.Unlock()
+	// Nobody is watching → stop auto-playing. The timer re-arms when someone
+	// (re)joins, so a match is never driven forward with an empty room.
+	if empty {
+		h.cancelTurn(c.matchID)
 	}
 }
 
@@ -108,9 +136,10 @@ func (h *Hub) broadcastState(ctx context.Context, matchID string, events json.Ra
 		log.Printf("broadcast %s: %v", matchID, err)
 		return
 	}
+	deadline := h.armTurn(matchID, meta)
 	hasEvents := len(events) > 0 && string(events) != "null"
 	for _, c := range h.clientsIn(matchID) {
-		if msg, err := h.stateMessage(ctx, matchID, c, meta); err == nil {
+		if msg, err := h.stateMessage(ctx, matchID, c, meta, deadline); err == nil {
 			c.trySend(msg)
 		}
 		if hasEvents {
@@ -124,7 +153,7 @@ func (h *Hub) broadcastState(ctx context.Context, matchID string, events json.Ra
 // stateMessage builds the redacted "state" message for one client: the
 // game-host's per-player view, augmented with whose turn it is and — when it is
 // this client's turn — the legal moves they may play.
-func (h *Hub) stateMessage(ctx context.Context, matchID string, c *Client, meta *MatchMeta) ([]byte, error) {
+func (h *Hub) stateMessage(ctx context.Context, matchID string, c *Client, meta *MatchMeta, deadline int64) ([]byte, error) {
 	view, err := h.gh.GetView(ctx, matchID, c.playerID)
 	if err != nil {
 		return nil, err
@@ -142,5 +171,88 @@ func (h *Hub) stateMessage(ctx context.Context, matchID string, c *Client, meta 
 			obj["legalMoves"] = legal
 		}
 	}
+	if deadline > 0 && !meta.Ended {
+		obj["turnDeadline"] = mustJSON(deadline)
+	}
 	return json.Marshal(obj)
+}
+
+/* ------------------------------- turn timer ------------------------------- */
+
+// armTurn (re)starts the timer for a match's current turn and returns the turn's
+// deadline (unix ms), or 0 when there's no timing (ended / disabled). Re-arming
+// for the SAME turn keeps the existing deadline, so a mid-turn broadcast (e.g. a
+// client reconnecting) doesn't reset the clock.
+func (h *Hub) armTurn(matchID string, meta *MatchMeta) int64 {
+	if h.turnLimit <= 0 {
+		return 0
+	}
+	h.tmu.Lock()
+	defer h.tmu.Unlock()
+	ts := h.turns[matchID]
+	if meta.Ended {
+		if ts != nil {
+			ts.timer.Stop()
+			delete(h.turns, matchID)
+		}
+		return 0
+	}
+	if ts != nil && ts.moveCount == meta.MoveCount {
+		return ts.deadline // same turn — keep the running clock
+	}
+	if ts != nil {
+		ts.timer.Stop()
+	}
+	mc := meta.MoveCount
+	deadline := time.Now().Add(h.turnLimit).UnixMilli()
+	t := time.AfterFunc(h.turnLimit, func() { h.onTurnTimeout(matchID, mc) })
+	h.turns[matchID] = &turnState{timer: t, moveCount: mc, deadline: deadline}
+	return deadline
+}
+
+func (h *Hub) cancelTurn(matchID string) {
+	h.tmu.Lock()
+	defer h.tmu.Unlock()
+	if ts := h.turns[matchID]; ts != nil {
+		ts.timer.Stop()
+		delete(h.turns, matchID)
+	}
+}
+
+// onTurnTimeout fires when a turn ran out of time. If it's still the same turn,
+// the match is live, and someone is watching, the hub auto-plays the first legal
+// move for the current player — then broadcasts, which arms the next turn.
+func (h *Hub) onTurnTimeout(matchID string, mc int) {
+	if len(h.clientsIn(matchID)) == 0 {
+		h.cancelTurn(matchID)
+		return
+	}
+	ctx := context.Background()
+	meta, err := h.gh.GetMatch(ctx, matchID)
+	if err != nil || meta.Ended || meta.MoveCount != mc {
+		return // stale or already moved/ended
+	}
+	legal, err := h.gh.GetLegalMoves(ctx, matchID)
+	if err != nil {
+		return
+	}
+	var moves []struct {
+		Type    string          `json:"type"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	if err := json.Unmarshal(legal, &moves); err != nil || len(moves) == 0 {
+		return
+	}
+	pick := moves[0] // first legal move: Pass on a bid, No-trump on trump, a card on play
+	res, status, err := h.gh.ApplyMove(ctx, matchID, meta.CurrentPlayer, pick.Type, pick.Payload)
+	if err != nil || status == 422 || res == nil || !res.OK {
+		log.Printf("turn timeout auto-move %s (%s): status=%d err=%v", matchID, meta.CurrentPlayer, status, err)
+		return
+	}
+	// Tell the room whose turn was auto-played, then broadcast the new state.
+	notice := mustJSON(map[string]any{"t": "turn_timeout", "matchId": matchID, "player": meta.CurrentPlayer, "auto": pick.Type})
+	for _, c := range h.clientsIn(matchID) {
+		c.trySend(notice)
+	}
+	h.broadcastState(ctx, matchID, res.Events)
 }

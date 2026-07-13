@@ -28,7 +28,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 func main() {
@@ -48,13 +50,22 @@ func main() {
 	origins := allowedOrigins(auth.frontendURL)
 	setWSAllowedOrigins(origins)
 
-	hub := NewHub(gh, auth)
+	// Per-turn time limit; on timeout the gateway auto-plays a safe move. Set
+	// TURN_SECONDS=0 to disable the timer entirely.
+	turnLimit := 60 * time.Second
+	if v := os.Getenv("TURN_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			turnLimit = time.Duration(n) * time.Second
+		}
+	}
+
+	hub := NewHub(gh, auth, turnLimit)
 	lobby := NewLobbyManager(gh)
 	gw := NewGateway(hub, gh, reg, auth, lobby, ghURL, adminToken, origins)
 
 	addr := env("GATEWAY_ADDR", ":8080")
-	log.Printf("bordiko gateway listening on %s → game-host %s (origins %v; publish %s)",
-		addr, ghURL, origins, map[bool]string{true: "enabled", false: "disabled (set ADMIN_TOKEN)"}[adminToken != ""])
+	log.Printf("bordiko gateway listening on %s → game-host %s (origins %v; publish %s; turn %s)",
+		addr, ghURL, origins, map[bool]string{true: "enabled", false: "disabled (set ADMIN_TOKEN)"}[adminToken != ""], turnLimit)
 	if err := http.ListenAndServe(addr, gw.Routes()); err != nil {
 		log.Fatalf("gateway failed: %v", err)
 	}

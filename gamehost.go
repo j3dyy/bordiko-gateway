@@ -146,6 +146,20 @@ func (g *GameHostClient) ApplyMove(ctx context.Context, id, playerID, mtype stri
 	return &res, status, nil
 }
 
+// EndMatch force-ends a match with the given result (used when a player leaves —
+// their team forfeits). Idempotent on the game-host side.
+func (g *GameHostClient) EndMatch(ctx context.Context, id string, result json.RawMessage, by string) error {
+	reqBody, _ := json.Marshal(map[string]any{"result": result, "by": by})
+	body, status, err := g.do(ctx, http.MethodPost, "/matches/"+id+"/end", reqBody)
+	if err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return fmt.Errorf("game-host end match: %d %s", status, truncate(body))
+	}
+	return nil
+}
+
 // ActiveMatch reports the unfinished match a player is currently in, if any —
 // used by the lobby to enforce one game at a time and to offer "resume".
 func (g *GameHostClient) ActiveMatch(ctx context.Context, playerID string) (matchID, gameID string, active bool, err error) {

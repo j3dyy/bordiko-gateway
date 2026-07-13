@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -67,6 +68,10 @@ func (gw *Gateway) Routes() http.Handler {
 	// Publish (admin-guarded) — proxies a game package to the internal registry
 	// so developers can publish over HTTPS while the registry stays private.
 	mux.HandleFunc("POST /api/publish", gw.handlePublish)
+
+	// Leave an in-progress match (login required) — the leaver's team forfeits so
+	// the others aren't stuck, and everyone is freed to start a new game.
+	mux.HandleFunc("POST /api/matches/{id}/leave", gw.requireAuth(gw.leaveMatch))
 
 	// Everything else under /api/ (match summary, view, legal, moves) is proxied
 	// straight through to the game-host.
@@ -222,6 +227,77 @@ func (gw *Gateway) cancelLobby(w http.ResponseWriter, r *http.Request, u *sessio
 	default:
 		w.WriteHeader(http.StatusNoContent)
 	}
+}
+
+// leaveMatch force-ends an in-progress match: the leaver's team forfeits (they
+// lose, everyone else wins) so no one is left stuck at an unfinishable table.
+func (gw *Gateway) leaveMatch(w http.ResponseWriter, r *http.Request, u *sessionClaims) {
+	id := r.PathValue("id")
+	ctx := r.Context()
+	meta, err := gw.gh.GetMatch(ctx, id)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
+		return
+	}
+	if !contains(meta.Players, u.Sub) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "not_in_match"})
+		return
+	}
+	if meta.Ended {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ended": true})
+		return
+	}
+
+	losers := gw.leaverTeam(ctx, id, u.Sub, meta.Players)
+	lose := make(map[string]bool, len(losers))
+	for _, p := range losers {
+		lose[p] = true
+	}
+	winners := make([]string, 0, len(meta.Players))
+	for _, p := range meta.Players {
+		if !lose[p] {
+			winners = append(winners, p)
+		}
+	}
+	name := u.Name
+	if name == "" {
+		name = "A player"
+	}
+	result, _ := json.Marshal(map[string]any{
+		"winners": winners, "losers": losers, "reason": name + " left the game",
+	})
+	if err := gw.gh.EndMatch(ctx, id, result, u.Sub); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "end_failed", "message": err.Error()})
+		return
+	}
+	// Push the now-ended state to everyone still in the room (game-over) and let
+	// the turn timer cancel itself.
+	gw.hub.broadcastState(ctx, id, nil)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ended": true})
+}
+
+// leaverTeam returns the players who share the leaver's partnership (so they
+// forfeit together). It reads the leaver's redacted view — games that model
+// teams (Jokeri) expose a `teams` array; others fall back to just the leaver.
+func (gw *Gateway) leaverTeam(ctx context.Context, id, leaver string, players []string) []string {
+	view, err := gw.gh.GetView(ctx, id, leaver)
+	if err == nil {
+		// The game state is nested under "G" in the redacted view (games that
+		// model teams — Jokeri — expose G.teams).
+		var v struct {
+			G struct {
+				Teams [][]string `json:"teams"`
+			} `json:"G"`
+		}
+		if json.Unmarshal(view, &v) == nil {
+			for _, team := range v.G.Teams {
+				if contains(team, leaver) {
+					return team
+				}
+			}
+		}
+	}
+	return []string{leaver}
 }
 
 /* ------------------------------ leaderboard ------------------------------- */
