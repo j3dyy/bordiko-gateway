@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -72,6 +73,7 @@ func (a *Auth) providerNames() []string {
 func (a *Auth) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /auth/providers", a.handleProviders)
 	mux.HandleFunc("GET /auth/me", a.handleMe)
+	mux.HandleFunc("POST /auth/username", a.handleSetName)
 	mux.HandleFunc("POST /auth/logout", a.handleLogout)
 	mux.HandleFunc("GET /auth/{provider}/login", a.handleLogin)
 	mux.HandleFunc("GET /auth/{provider}/callback", a.handleCallback)
@@ -95,6 +97,74 @@ func (a *Auth) handleMe(w http.ResponseWriter, r *http.Request) {
 		"displayName": claims.Name,
 		"avatarUrl":   claims.Avatar,
 	})
+}
+
+// handleSetName lets a signed-in user pick a display name (so the board shows a
+// real name, not the raw provider id). Updates the account and re-issues the
+// session cookie so the new name takes effect everywhere immediately.
+func (a *Auth) handleSetName(w http.ResponseWriter, r *http.Request) {
+	claims, ok := a.sessionUser(r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "not_authenticated"})
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_request"})
+		return
+	}
+	name := sanitizeName(req.Name)
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_name", "message": "name must be 1–24 characters"})
+		return
+	}
+	u, err := a.users.Get(r.Context(), claims.Sub)
+	if err != nil || u == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "no_account"})
+		return
+	}
+	u.DisplayName = name
+	if err := a.users.Upsert(r.Context(), u); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "save_failed"})
+		return
+	}
+	a.setSession(w, u) // refresh the cookie so claims.Name updates now
+	writeJSON(w, http.StatusOK, map[string]any{"id": u.ID, "displayName": u.DisplayName, "avatarUrl": u.AvatarURL})
+}
+
+// sanitizeName trims, collapses inner whitespace, strips control characters, and
+// caps the length at 24 runes.
+func sanitizeName(raw string) string {
+	s := strings.Join(strings.Fields(raw), " ")
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+	runes := []rune(s)
+	if len(runes) > 24 {
+		runes = runes[:24]
+	}
+	return strings.TrimSpace(string(runes))
+}
+
+// DisplayNames resolves a set of user ids to their display names (best-effort),
+// so the gateway can label players on the board by name instead of raw id.
+func (a *Auth) DisplayNames(ctx context.Context, ids []string) map[string]string {
+	out := make(map[string]string, len(ids))
+	users, err := a.users.GetMany(ctx, ids)
+	if err != nil {
+		return out
+	}
+	for id, u := range users {
+		if u != nil && u.DisplayName != "" {
+			out[id] = u.DisplayName
+		}
+	}
+	return out
 }
 
 func (a *Auth) handleLogout(w http.ResponseWriter, _ *http.Request) {

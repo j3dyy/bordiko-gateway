@@ -124,7 +124,8 @@ func (h *Hub) serveWS(w http.ResponseWriter, r *http.Request) {
 	// Push the current state to the freshly-joined client, arming (or resuming)
 	// this match's turn timer now that someone is watching again.
 	deadline := h.armTurn(matchID, meta)
-	if msg, err := h.stateMessage(context.Background(), matchID, c, meta, deadline); err == nil {
+	names := h.auth.DisplayNames(context.Background(), meta.Players)
+	if msg, err := h.stateMessage(context.Background(), matchID, c, meta, deadline, names); err == nil {
 		c.trySend(msg)
 	}
 }

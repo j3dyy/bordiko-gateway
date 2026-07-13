@@ -137,9 +137,10 @@ func (h *Hub) broadcastState(ctx context.Context, matchID string, events json.Ra
 		return
 	}
 	deadline := h.armTurn(matchID, meta)
+	names := h.auth.DisplayNames(ctx, meta.Players)
 	hasEvents := len(events) > 0 && string(events) != "null"
 	for _, c := range h.clientsIn(matchID) {
-		if msg, err := h.stateMessage(ctx, matchID, c, meta, deadline); err == nil {
+		if msg, err := h.stateMessage(ctx, matchID, c, meta, deadline, names); err == nil {
 			c.trySend(msg)
 		}
 		if hasEvents {
@@ -153,7 +154,7 @@ func (h *Hub) broadcastState(ctx context.Context, matchID string, events json.Ra
 // stateMessage builds the redacted "state" message for one client: the
 // game-host's per-player view, augmented with whose turn it is and — when it is
 // this client's turn — the legal moves they may play.
-func (h *Hub) stateMessage(ctx context.Context, matchID string, c *Client, meta *MatchMeta, deadline int64) ([]byte, error) {
+func (h *Hub) stateMessage(ctx context.Context, matchID string, c *Client, meta *MatchMeta, deadline int64, names map[string]string) ([]byte, error) {
 	view, err := h.gh.GetView(ctx, matchID, c.playerID)
 	if err != nil {
 		return nil, err
@@ -164,6 +165,9 @@ func (h *Hub) stateMessage(ctx context.Context, matchID string, c *Client, meta 
 	}
 	obj["t"] = mustJSON("state")
 	obj["matchId"] = mustJSON(matchID)
+	if len(names) > 0 {
+		obj["names"] = mustJSON(names) // player id → display name, for labelling the board
+	}
 	yourTurn := !meta.Ended && meta.CurrentPlayer == c.playerID
 	obj["yourTurn"] = mustJSON(yourTurn)
 	if yourTurn {
