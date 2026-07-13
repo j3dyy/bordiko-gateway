@@ -73,6 +73,10 @@ func (gw *Gateway) Routes() http.Handler {
 	// the others aren't stuck, and everyone is freed to start a new game.
 	mux.HandleFunc("POST /api/matches/{id}/leave", gw.requireAuth(gw.leaveMatch))
 
+	// The signed-in user's active (unfinished) match, if any — lets the client
+	// offer "resume your game" on load and after a reconnect.
+	mux.HandleFunc("GET /api/active", gw.requireAuth(gw.handleActive))
+
 	// Everything else under /api/ (match summary, view, legal, moves) is proxied
 	// straight through to the game-host.
 	target, _ := url.Parse(gw.ghURL)
@@ -227,6 +231,17 @@ func (gw *Gateway) cancelLobby(w http.ResponseWriter, r *http.Request, u *sessio
 	default:
 		w.WriteHeader(http.StatusNoContent)
 	}
+}
+
+// handleActive reports the signed-in user's current unfinished match (if any),
+// so the client can offer to resume it on load / after a reconnect.
+func (gw *Gateway) handleActive(w http.ResponseWriter, r *http.Request, u *sessionClaims) {
+	mid, gid, active, err := gw.gh.ActiveMatch(r.Context(), u.Sub)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"active": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"active": active, "matchId": mid, "gameId": gid})
 }
 
 // leaveMatch force-ends an in-progress match: the leaver's team forfeits (they
