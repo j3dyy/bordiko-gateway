@@ -125,11 +125,11 @@ func (a *Auth) handleSetName(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "no_account"})
 		return
 	}
-	u.DisplayName = name
-	if err := a.users.Upsert(r.Context(), u); err != nil {
+	if err := a.users.SetDisplayName(r.Context(), u.ID, name); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "save_failed"})
 		return
 	}
+	u.DisplayName = name
 	a.setSession(w, u) // refresh the cookie so claims.Name updates now
 	writeJSON(w, http.StatusOK, map[string]any{"id": u.ID, "displayName": u.DisplayName, "avatarUrl": u.AvatarURL})
 }

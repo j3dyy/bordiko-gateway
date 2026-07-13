@@ -31,6 +31,9 @@ type User struct {
 // lifetime of the process (fine for dev / dev-login).
 type UserStore interface {
 	Upsert(ctx context.Context, u *User) error
+	// SetDisplayName updates just the chosen display name (a login Upsert never
+	// overwrites it, so a custom name survives re-login).
+	SetDisplayName(ctx context.Context, id, name string) error
 	Get(ctx context.Context, id string) (*User, error)
 	GetMany(ctx context.Context, ids []string) (map[string]*User, error)
 	Close() error
@@ -51,13 +54,24 @@ func (s *MemoryUserStore) Upsert(_ context.Context, u *User) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing, ok := s.users[u.ID]; ok {
-		// Preserve original creation time; refresh mutable profile fields.
+		// Preserve creation time AND a user-chosen display name (login must not
+		// clobber it); refresh the other profile fields.
 		u.CreatedAt = existing.CreatedAt
+		u.DisplayName = existing.DisplayName
 	} else if u.CreatedAt.IsZero() {
 		u.CreatedAt = time.Now()
 	}
 	cp := *u
 	s.users[u.ID] = &cp
+	return nil
+}
+
+func (s *MemoryUserStore) SetDisplayName(_ context.Context, id, name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if u, ok := s.users[id]; ok {
+		u.DisplayName = name
+	}
 	return nil
 }
 
@@ -122,14 +136,19 @@ func NewPostgresUserStore(ctx context.Context, url string) (*PostgresUserStore, 
 }
 
 func (s *PostgresUserStore) Upsert(ctx context.Context, u *User) error {
-	_, err := s.pool.Exec(ctx,
+	err := s.pool.QueryRow(ctx,
 		`INSERT INTO users (id, provider, provider_id, display_name, avatar_url, email)
 		 VALUES ($1,$2,$3,$4,$5,$6)
 		 ON CONFLICT (id) DO UPDATE
-		   SET display_name = EXCLUDED.display_name,
-		       avatar_url   = EXCLUDED.avatar_url,
-		       email        = EXCLUDED.email`,
-		u.ID, u.Provider, u.ProviderID, u.DisplayName, u.AvatarURL, u.Email)
+		   SET avatar_url = EXCLUDED.avatar_url,
+		       email      = EXCLUDED.email
+		 RETURNING display_name`, // display_name preserved on conflict — see SetDisplayName
+		u.ID, u.Provider, u.ProviderID, u.DisplayName, u.AvatarURL, u.Email).Scan(&u.DisplayName)
+	return err
+}
+
+func (s *PostgresUserStore) SetDisplayName(ctx context.Context, id, name string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE users SET display_name=$2 WHERE id=$1`, id, name)
 	return err
 }
 
