@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -56,9 +57,10 @@ type Lobby struct {
 	ID          string    `json:"id"`
 	GameID      string    `json:"gameId"`
 	Host        string    `json:"host"`
-	Mode        string    `json:"mode"`       // "solo" | "teams"
-	Visibility  string    `json:"visibility"` // "public" | "private"
+	Mode        string    `json:"mode"`             // "solo" | "teams"
+	Visibility  string    `json:"visibility"`       // "public" | "private"
 	HasPassword bool      `json:"hasPassword"`
+	Khisht      string    `json:"khisht,omitempty"` // jokeri only: "spec" | a flat number; "" ⇒ game default
 	Seats       []Seat    `json:"seats"`
 	MatchID     string    `json:"matchId,omitempty"`
 	Status      string    `json:"status"` // "open" | "started"
@@ -146,11 +148,20 @@ func (l *Lobby) matchConfig() json.RawMessage {
 	for _, t := range teamIDs {
 		teams = append(teams, byTeam[t])
 	}
-	b, _ := json.Marshal(map[string]any{
+	cfg := map[string]any{
 		"mode":      l.Mode,
 		"seatCount": len(l.Seats),
 		"teams":     teams,
-	})
+	}
+	// Jokeri's khisht rule. "spec" (−100 × deal size) stays a string; a flat rule
+	// is emitted as a real JSON number so the game reads it as one. Empty ⇒ omit,
+	// letting the game apply its own default.
+	if l.Khisht == "spec" {
+		cfg["khisht"] = "spec"
+	} else if n, err := strconv.Atoi(l.Khisht); err == nil {
+		cfg["khisht"] = n
+	}
+	b, _ := json.Marshal(cfg)
 	return b
 }
 
@@ -166,7 +177,7 @@ func NewLobbyManager(gh *GameHostClient) *LobbyManager {
 
 // Create opens a new table with the host already seated at seat 0. Teams mode
 // requires an even seat count of at least 4; anything else falls back to solo.
-func (m *LobbyManager) Create(host LobbyPlayer, gameID string, seatCount int, mode, visibility, password string) *Lobby {
+func (m *LobbyManager) Create(host LobbyPlayer, gameID string, seatCount int, mode, visibility, password, khisht string) *Lobby {
 	if seatCount < 2 {
 		seatCount = 2
 	}
@@ -202,6 +213,7 @@ func (m *LobbyManager) Create(host LobbyPlayer, gameID string, seatCount int, mo
 		Mode:        mode,
 		Visibility:  visibility,
 		HasPassword: password != "",
+		Khisht:      khisht,
 		Seats:       seats,
 		Status:      "open",
 		CreatedAt:   time.Now(),
