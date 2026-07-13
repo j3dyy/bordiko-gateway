@@ -73,8 +73,9 @@ type clientMessage struct {
 		Type    string          `json:"type"`
 		Payload json.RawMessage `json:"payload"`
 	} `json:"move"`
-	Text string `json:"text"` // chat message body
-	TS   int64  `json:"ts"`
+	Text  string `json:"text"`  // chat message body
+	Emote string `json:"emote"` // quick reaction key (see handleEmote)
+	TS    int64  `json:"ts"`
 }
 
 func (h *Hub) serveWS(w http.ResponseWriter, r *http.Request) {
@@ -167,6 +168,8 @@ func (c *Client) readPump() {
 			c.hub.handleMove(ctx, c, cm)
 		case "chat":
 			c.hub.handleChat(c, cm)
+		case "emote":
+			c.hub.handleEmote(c, cm)
 		case "ping":
 			c.trySend(mustJSON(map[string]any{"t": "pong", "ts": cm.TS}))
 		case "leave":

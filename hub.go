@@ -128,6 +128,28 @@ func (h *Hub) handleChat(c *Client, cm clientMessage) {
 	}
 }
 
+// allowedEmotes is the fixed set of quick reactions a client may send (keeps the
+// channel to a known, safe vocabulary — the client can't inject arbitrary text).
+var allowedEmotes = map[string]bool{
+	"ring": true, "love": true, "like": true, "dislike": true,
+	"haha": true, "clap": true, "wow": true, "think": true,
+}
+
+// handleEmote relays a quick reaction (a "poke"/emoji) to everyone in the match
+// room. Ephemeral like chat; the name comes from the session so it can't be
+// spoofed.
+func (h *Hub) handleEmote(c *Client, cm clientMessage) {
+	if !allowedEmotes[cm.Emote] {
+		return
+	}
+	msg := mustJSON(map[string]any{
+		"t": "emote", "matchId": c.matchID, "from": c.playerID, "name": c.playerName, "emote": cm.Emote, "ts": cm.TS,
+	})
+	for _, cl := range h.clientsIn(c.matchID) {
+		cl.trySend(msg)
+	}
+}
+
 // broadcastState sends every client in the room its own redacted view (plus the
 // current player's legal moves) and the events from the last move.
 func (h *Hub) broadcastState(ctx context.Context, matchID string, events json.RawMessage) {
