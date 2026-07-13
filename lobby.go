@@ -61,6 +61,7 @@ type Lobby struct {
 	Visibility  string    `json:"visibility"`       // "public" | "private"
 	HasPassword bool      `json:"hasPassword"`
 	Khisht      string    `json:"khisht,omitempty"` // jokeri only: "spec" | a flat number; "" ⇒ game default
+	Format      string    `json:"format,omitempty"` // jokeri only: "nines" (direct-nines); "" ⇒ standard
 	Seats       []Seat    `json:"seats"`
 	MatchID     string    `json:"matchId,omitempty"`
 	Status      string    `json:"status"` // "open" | "started"
@@ -161,6 +162,11 @@ func (l *Lobby) matchConfig() json.RawMessage {
 	} else if n, err := strconv.Atoi(l.Khisht); err == nil {
 		cfg["khisht"] = n
 	}
+	// Jokeri's deal schedule. Only "nines" (direct-nines) is special; anything
+	// else is omitted, letting the game default to the standard 24-deal classic.
+	if l.Format == "nines" {
+		cfg["format"] = "nines"
+	}
 	b, _ := json.Marshal(cfg)
 	return b
 }
@@ -177,7 +183,7 @@ func NewLobbyManager(gh *GameHostClient) *LobbyManager {
 
 // Create opens a new table with the host already seated at seat 0. Teams mode
 // requires an even seat count of at least 4; anything else falls back to solo.
-func (m *LobbyManager) Create(host LobbyPlayer, gameID string, seatCount int, mode, visibility, password, khisht string) *Lobby {
+func (m *LobbyManager) Create(host LobbyPlayer, gameID string, seatCount int, mode, visibility, password, khisht, format string) *Lobby {
 	if seatCount < 2 {
 		seatCount = 2
 	}
@@ -197,6 +203,9 @@ func (m *LobbyManager) Create(host LobbyPlayer, gameID string, seatCount int, mo
 	if password != "" {
 		visibility = "private"
 	}
+	if format != "nines" {
+		format = "" // only direct-nines is a non-default schedule
+	}
 	seats := make([]Seat, seatCount)
 	for i := range seats {
 		seats[i] = Seat{Index: i, Team: teamOf(i, mode)}
@@ -214,6 +223,7 @@ func (m *LobbyManager) Create(host LobbyPlayer, gameID string, seatCount int, mo
 		Visibility:  visibility,
 		HasPassword: password != "",
 		Khisht:      khisht,
+		Format:      format,
 		Seats:       seats,
 		Status:      "open",
 		CreatedAt:   time.Now(),

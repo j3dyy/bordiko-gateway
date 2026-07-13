@@ -119,7 +119,8 @@ func (gw *Gateway) createLobby(w http.ResponseWriter, r *http.Request, u *sessio
 		Mode       string `json:"mode"`
 		Visibility string `json:"visibility"`
 		Password   string `json:"password"`
-		Khisht     string `json:"khisht"` // jokeri only: "spec" | "-200" | "-500" | "" (default)
+		Khisht     string `json:"khisht"`  // jokeri only: "spec" | "-200" | "-500" | "" (default)
+		Format     string `json:"format"`  // jokeri only: "nines" | "" (standard)
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.GameID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_request", "message": "gameId required"})
@@ -128,7 +129,7 @@ func (gw *Gateway) createLobby(w http.ResponseWriter, r *http.Request, u *sessio
 	if gw.blockIfInGame(w, r, u) {
 		return
 	}
-	l := gw.lobby.Create(LobbyPlayer{ID: u.Sub, Name: u.Name}, req.GameID, req.Seats, req.Mode, req.Visibility, req.Password, req.Khisht)
+	l := gw.lobby.Create(LobbyPlayer{ID: u.Sub, Name: u.Name}, req.GameID, req.Seats, req.Mode, req.Visibility, req.Password, req.Khisht, req.Format)
 	writeJSON(w, http.StatusCreated, l)
 }
 
