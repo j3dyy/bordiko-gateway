@@ -100,6 +100,17 @@ func (a *Auth) handleMe(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "not_authenticated"})
 		return
 	}
+	// Self-heal: if this account isn't in the store yet (e.g. logged in before
+	// accounts were persisted, session still valid so never re-logged-in), add it
+	// from the session so the leaderboard/board can resolve the name — no re-login
+	// needed. Skip if already present (never clobber a saved name/email).
+	if u, _ := a.users.Get(r.Context(), claims.Sub); u == nil {
+		provider, pid := "unknown", claims.Sub
+		if i := strings.IndexByte(claims.Sub, ':'); i >= 0 {
+			provider, pid = claims.Sub[:i], claims.Sub[i+1:]
+		}
+		_ = a.users.Upsert(r.Context(), &User{ID: claims.Sub, Provider: provider, ProviderID: pid, DisplayName: claims.Name, AvatarURL: claims.Avatar})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":          claims.Sub,
 		"displayName": claims.Name,
