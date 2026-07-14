@@ -59,6 +59,14 @@ func main() {
 		}
 	}
 
+	// How long a bot pauses before playing (BOT_DELAY_MS, default 900ms) — lower
+	// it to speed up bot-heavy tables, 0 for instant.
+	if v := os.Getenv("BOT_DELAY_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			botDelay = time.Duration(n) * time.Millisecond
+		}
+	}
+
 	hub := NewHub(gh, auth, turnLimit)
 	lobby := NewLobbyManager(gh)
 	gw := NewGateway(hub, gh, reg, auth, lobby, ghURL, adminToken, origins)

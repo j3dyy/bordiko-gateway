@@ -24,7 +24,15 @@ type Hub struct {
 	turnLimit time.Duration
 	tmu       sync.Mutex
 	turns     map[string]*turnState
+
+	botMu    sync.Mutex
+	botTurns map[string]int // matchID → moveCount already scheduled for a bot
 }
+
+// botDelay is the pause before a bot plays its turn, so the table can watch each
+// move land rather than the bots resolving a whole trick instantly. Tunable via
+// BOT_DELAY_MS (see main.go).
+var botDelay = 900 * time.Millisecond
 
 // turnState is the live timer for one match's current turn.
 type turnState struct {
@@ -40,6 +48,7 @@ func NewHub(gh *GameHostClient, auth *Auth, turnLimit time.Duration) *Hub {
 		auth:      auth,
 		turnLimit: turnLimit,
 		turns:     make(map[string]*turnState),
+		botTurns:  make(map[string]int),
 	}
 }
 
@@ -159,6 +168,7 @@ func (h *Hub) broadcastState(ctx context.Context, matchID string, events json.Ra
 		return
 	}
 	deadline := h.armTurn(matchID, meta)
+	h.maybeDriveBot(matchID, meta)
 	names := h.resolveNames(ctx, matchID, meta.Players)
 	hasEvents := len(events) > 0 && string(events) != "null"
 	for _, c := range h.clientsIn(matchID) {
@@ -182,6 +192,12 @@ func (h *Hub) resolveNames(ctx context.Context, matchID string, players []string
 	for _, c := range h.clientsIn(matchID) {
 		if c.playerName != "" {
 			names[c.playerID] = c.playerName
+		}
+	}
+	// Bots never connect over WS and aren't in the user store — label them here.
+	for _, p := range players {
+		if isBot(p) {
+			names[p] = botDisplayName(p)
 		}
 	}
 	return names
@@ -252,11 +268,15 @@ func (h *Hub) armTurn(matchID string, meta *MatchMeta) int64 {
 
 func (h *Hub) cancelTurn(matchID string) {
 	h.tmu.Lock()
-	defer h.tmu.Unlock()
 	if ts := h.turns[matchID]; ts != nil {
 		ts.timer.Stop()
 		delete(h.turns, matchID)
 	}
+	h.tmu.Unlock()
+	// Forget any scheduled bot turn so a rejoin re-drives it from scratch.
+	h.botMu.Lock()
+	delete(h.botTurns, matchID)
+	h.botMu.Unlock()
 }
 
 // onTurnTimeout fires when a turn ran out of time. If it's still the same turn,
@@ -293,6 +313,75 @@ func (h *Hub) onTurnTimeout(matchID string, mc int) {
 	notice := mustJSON(map[string]any{"t": "turn_timeout", "matchId": matchID, "player": meta.CurrentPlayer, "auto": pick.Type})
 	for _, c := range h.clientsIn(matchID) {
 		c.trySend(notice)
+	}
+	h.broadcastState(ctx, matchID, res.Events)
+}
+
+/* --------------------------------- bots ----------------------------------- */
+
+func botDisplayName(id string) string {
+	if n := strings.TrimPrefix(id, botPrefix); n != id {
+		return "Bot " + n
+	}
+	return "Bot"
+}
+
+// maybeDriveBot schedules a bot's move when it's a bot's turn and at least one
+// human is watching (bots never open a WebSocket, so any client in the room is a
+// human). It's idempotent per turn: a repeat broadcast for the same move count
+// (e.g. a reconnect) won't double-schedule. When the bot plays it broadcasts,
+// which calls this again for the next actor — so a run of consecutive bot seats
+// resolves one visible move at a time until a human is on turn or the hand ends.
+func (h *Hub) maybeDriveBot(matchID string, meta *MatchMeta) {
+	if meta.Ended || !isBot(meta.CurrentPlayer) {
+		return
+	}
+	if len(h.clientsIn(matchID)) == 0 {
+		return // nobody watching — don't drive the table forward
+	}
+	h.botMu.Lock()
+	if h.botTurns[matchID] == meta.MoveCount {
+		h.botMu.Unlock()
+		return
+	}
+	h.botTurns[matchID] = meta.MoveCount
+	h.botMu.Unlock()
+
+	mc := meta.MoveCount
+	time.AfterFunc(botDelay, func() { h.driveBot(matchID, mc) })
+}
+
+// driveBot plays one bot move for the match's current (bot) player: fetch its
+// view + legal moves, choose one, apply it, and broadcast.
+func (h *Hub) driveBot(matchID string, mc int) {
+	if len(h.clientsIn(matchID)) == 0 {
+		return
+	}
+	ctx := context.Background()
+	meta, err := h.gh.GetMatch(ctx, matchID)
+	if err != nil || meta.Ended || meta.MoveCount != mc || !isBot(meta.CurrentPlayer) {
+		return // stale, ended, already moved, or no longer a bot's turn
+	}
+	view, err := h.gh.GetView(ctx, matchID, meta.CurrentPlayer)
+	if err != nil {
+		return
+	}
+	legalRaw, err := h.gh.GetLegalMoves(ctx, matchID)
+	if err != nil {
+		return
+	}
+	var legal []moveDesc
+	if err := json.Unmarshal(legalRaw, &legal); err != nil || len(legal) == 0 {
+		return
+	}
+	pick := chooseBotMove(meta.GameID, view, legal)
+	if pick == nil {
+		return
+	}
+	res, status, err := h.gh.ApplyMove(ctx, matchID, meta.CurrentPlayer, pick.Type, pick.Payload)
+	if err != nil || status == 422 || res == nil || !res.OK {
+		log.Printf("bot move %s (%s): status=%d err=%v", matchID, meta.CurrentPlayer, status, err)
+		return
 	}
 	h.broadcastState(ctx, matchID, res.Events)
 }

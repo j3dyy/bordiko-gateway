@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 	"sync"
@@ -37,11 +38,13 @@ var (
 	ErrNotSeated     = errors.New("you are not seated at this table")
 	ErrNotReady      = errors.New("every seat must be filled to start")
 	ErrWrongPassword = errors.New("wrong table password")
+	ErrNotBotSeat    = errors.New("that seat is not a bot")
 )
 
 type LobbyPlayer struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+	Bot  bool   `json:"bot,omitempty"` // a computer player added by the host to fill a seat
 }
 
 // Seat is one place at the table. Team encodes the partnership: in "teams" mode
@@ -340,6 +343,73 @@ func (m *LobbyManager) Stand(id, playerID string) (*Lobby, error) {
 		return nil, ErrNotSeated
 	}
 	l.Seats[cur].Player = nil
+	return cloneLobby(l), nil
+}
+
+// AddBot seats a computer player in a specific empty seat. Host only — bots are
+// how a host fills a short table (e.g. a 4-player Jokeri with only 2 humans). The
+// bot gets a stable id ("bot:N") so the game-host, hub driver, and scoreboard can
+// all recognise it; the hub plays its turns automatically.
+func (m *LobbyManager) AddBot(id, hostID string, seatIndex int) (*Lobby, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	l, ok := m.lobbies[id]
+	if !ok {
+		return nil, ErrLobbyNotFound
+	}
+	if l.Host != hostID {
+		return nil, ErrNotHost
+	}
+	if l.Status != "open" {
+		return nil, ErrLobbyStarted
+	}
+	if seatIndex < 0 || seatIndex >= len(l.Seats) {
+		return nil, ErrBadSeat
+	}
+	if l.Seats[seatIndex].Player != nil {
+		return nil, ErrSeatTaken
+	}
+	// Lowest bot number not already at the table (bots may have been removed).
+	used := map[int]bool{}
+	for i := range l.Seats {
+		if p := l.Seats[i].Player; p != nil && p.Bot {
+			var n int
+			if _, err := fmt.Sscanf(p.ID, "bot:%d", &n); err == nil {
+				used[n] = true
+			}
+		}
+	}
+	n := 1
+	for used[n] {
+		n++
+	}
+	l.Seats[seatIndex].Player = &LobbyPlayer{ID: fmt.Sprintf("bot:%d", n), Name: fmt.Sprintf("Bot %d", n), Bot: true}
+	return cloneLobby(l), nil
+}
+
+// RemoveBot vacates a bot's seat. Host only; the seat must currently hold a bot
+// (a human's seat is vacated via Stand, by that human).
+func (m *LobbyManager) RemoveBot(id, hostID string, seatIndex int) (*Lobby, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	l, ok := m.lobbies[id]
+	if !ok {
+		return nil, ErrLobbyNotFound
+	}
+	if l.Host != hostID {
+		return nil, ErrNotHost
+	}
+	if l.Status != "open" {
+		return nil, ErrLobbyStarted
+	}
+	if seatIndex < 0 || seatIndex >= len(l.Seats) {
+		return nil, ErrBadSeat
+	}
+	p := l.Seats[seatIndex].Player
+	if p == nil || !p.Bot {
+		return nil, ErrNotBotSeat
+	}
+	l.Seats[seatIndex].Player = nil
 	return cloneLobby(l), nil
 }
 

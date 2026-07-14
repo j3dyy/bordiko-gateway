@@ -129,6 +129,9 @@ func (h *Hub) serveWS(w http.ResponseWriter, r *http.Request) {
 	if msg, err := h.stateMessage(context.Background(), matchID, c, meta, deadline, names); err == nil {
 		c.trySend(msg)
 	}
+	// If it's a bot's turn (e.g. the match just started, or a human reconnects
+	// mid-bot-run), start the bot now that someone is watching.
+	h.maybeDriveBot(matchID, meta)
 }
 
 func (c *Client) close() {

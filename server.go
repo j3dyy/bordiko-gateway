@@ -48,6 +48,8 @@ func (gw *Gateway) Routes() http.Handler {
 	mux.HandleFunc("POST /api/lobby/{id}/join", gw.requireAuth(gw.joinLobby))
 	mux.HandleFunc("POST /api/lobby/{id}/sit", gw.requireAuth(gw.sitLobby))
 	mux.HandleFunc("POST /api/lobby/{id}/stand", gw.requireAuth(gw.standLobby))
+	mux.HandleFunc("POST /api/lobby/{id}/addbot", gw.requireAuth(gw.addBotLobby))
+	mux.HandleFunc("POST /api/lobby/{id}/removebot", gw.requireAuth(gw.removeBotLobby))
 	mux.HandleFunc("POST /api/lobby/{id}/start", gw.requireAuth(gw.startLobby))
 	mux.HandleFunc("DELETE /api/lobby/{id}", gw.requireAuth(gw.cancelLobby))
 
@@ -189,6 +191,33 @@ func (gw *Gateway) standLobby(w http.ResponseWriter, r *http.Request, u *session
 	gw.writeLobby(w, l, err)
 }
 
+// addBotLobby fills an empty seat with a computer player (host only). Bots let a
+// host start a short table — e.g. a 4-player Jokeri with fewer humans.
+func (gw *Gateway) addBotLobby(w http.ResponseWriter, r *http.Request, u *sessionClaims) {
+	var req struct {
+		Seat int `json:"seat"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_request"})
+		return
+	}
+	l, err := gw.lobby.AddBot(r.PathValue("id"), u.Sub, req.Seat)
+	gw.writeLobby(w, l, err)
+}
+
+// removeBotLobby vacates a bot's seat (host only).
+func (gw *Gateway) removeBotLobby(w http.ResponseWriter, r *http.Request, u *sessionClaims) {
+	var req struct {
+		Seat int `json:"seat"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_request"})
+		return
+	}
+	l, err := gw.lobby.RemoveBot(r.PathValue("id"), u.Sub, req.Seat)
+	gw.writeLobby(w, l, err)
+}
+
 // startLobby begins the match — host only, once every seat is filled.
 func (gw *Gateway) startLobby(w http.ResponseWriter, r *http.Request, u *sessionClaims) {
 	l, err := gw.lobby.Start(r.Context(), r.PathValue("id"), u.Sub)
@@ -207,6 +236,8 @@ func (gw *Gateway) writeLobby(w http.ResponseWriter, l *Lobby, err error) {
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": "not_host"})
 	case errors.Is(err, ErrBadSeat):
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_seat"})
+	case errors.Is(err, ErrNotBotSeat):
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "not_bot_seat"})
 	case errors.Is(err, ErrSeatTaken):
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "seat_taken"})
 	case errors.Is(err, ErrNotSeated):
