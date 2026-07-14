@@ -190,8 +190,8 @@ func (m *LobbyManager) Create(host LobbyPlayer, gameID string, seatCount int, mo
 	if seatCount < 2 {
 		seatCount = 2
 	}
-	if seatCount > 8 {
-		seatCount = 8
+	if seatCount > 10 {
+		seatCount = 10
 	}
 	if mode != "teams" {
 		mode = "solo"
