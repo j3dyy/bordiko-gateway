@@ -62,6 +62,9 @@ func (gw *Gateway) Routes() http.Handler {
 	// A published game's own images (Option 1c) — proxied from the internal
 	// registry so the browser loads them from the gateway origin. Public read.
 	mux.HandleFunc("GET /api/games/{id}/assets/{assetId}", gw.handleAsset)
+	// A game's own sandboxed UI bundle (Option 2), served under a strict CSP for
+	// the isolated iframe.
+	mux.HandleFunc("GET /api/games/{id}/ui", gw.handleUI)
 	// Rich catalog (public read) — per-game metadata + real rating/plays/live,
 	// consumed by the Discover screen.
 	mux.HandleFunc("GET /api/catalog", gw.handleCatalog)
@@ -408,6 +411,31 @@ func (gw *Gateway) handleLeaderboard(w http.ResponseWriter, r *http.Request) {
 // handleGames returns the browse catalog: the union of games published to the
 // registry and games the game-host already has loaded. Either source failing is
 // non-fatal — we return whatever we can reach.
+// sandboxCSP locks down a game's UI bundle: inline script/style only (it's a
+// self-contained bundle), images allowed, but NO network of any kind
+// (connect-src 'none' blocks fetch/XHR/WebSocket) and no forms — so an untrusted
+// UI can't call home or phish. Combined with the iframe's `sandbox="allow-scripts"`
+// (opaque origin, no cookies/DOM), the UI can only postMessage to the host.
+const sandboxCSP = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
+	"img-src https: data:; font-src data: https:; connect-src 'none'; base-uri 'none'; form-action 'none'"
+
+// handleUI streams a game's sandboxed UI bundle from the registry under the CSP.
+func (gw *Gateway) handleUI(w http.ResponseWriter, r *http.Request) {
+	body, status, err := gw.reg.UI(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "registry_unavailable"})
+		return
+	}
+	if status != http.StatusOK {
+		writeJSON(w, status, map[string]any{"error": "no_ui"})
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", sandboxCSP)
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	_, _ = w.Write(body)
+}
+
 // handleAsset streams a published game's image from the registry to the browser.
 func (gw *Gateway) handleAsset(w http.ResponseWriter, r *http.Request) {
 	body, ct, status, err := gw.reg.Asset(r.Context(), r.PathValue("id"), r.PathValue("assetId"))

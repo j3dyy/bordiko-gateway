@@ -47,6 +47,25 @@ func (r *RegistryClient) Asset(ctx context.Context, gameID, assetID string) ([]b
 	return body, resp.Header.Get("Content-Type"), resp.StatusCode, nil
 }
 
+// UI fetches a game's self-contained sandboxed UI bundle (Option 2) from the
+// registry. The gateway serves it to the browser under a strict CSP.
+func (r *RegistryClient) UI(ctx context.Context, gameID string) ([]byte, int, error) {
+	if !r.configured() {
+		return nil, http.StatusNotFound, nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.base+"/games/"+url.PathEscape(gameID)+"/ui", nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	resp, err := r.hc.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return body, resp.StatusCode, nil
+}
+
 // Catalog returns the game ids published to the registry. Best-effort: callers
 // treat any error as "no registry games" and fall back to other sources.
 func (r *RegistryClient) Catalog(ctx context.Context) ([]string, error) {
