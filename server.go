@@ -59,6 +59,9 @@ func (gw *Gateway) Routes() http.Handler {
 	// Catalog (public read) — union of the registry's published games and the
 	// game-host's loaded games, so the browse list reflects the marketplace.
 	mux.HandleFunc("GET /api/games", gw.handleGames)
+	// A published game's own images (Option 1c) — proxied from the internal
+	// registry so the browser loads them from the gateway origin. Public read.
+	mux.HandleFunc("GET /api/games/{id}/assets/{assetId}", gw.handleAsset)
 	// Rich catalog (public read) — per-game metadata + real rating/plays/live,
 	// consumed by the Discover screen.
 	mux.HandleFunc("GET /api/catalog", gw.handleCatalog)
@@ -405,6 +408,24 @@ func (gw *Gateway) handleLeaderboard(w http.ResponseWriter, r *http.Request) {
 // handleGames returns the browse catalog: the union of games published to the
 // registry and games the game-host already has loaded. Either source failing is
 // non-fatal — we return whatever we can reach.
+// handleAsset streams a published game's image from the registry to the browser.
+func (gw *Gateway) handleAsset(w http.ResponseWriter, r *http.Request) {
+	body, ct, status, err := gw.reg.Asset(r.Context(), r.PathValue("id"), r.PathValue("assetId"))
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "registry_unavailable"})
+		return
+	}
+	if status != http.StatusOK {
+		writeJSON(w, status, map[string]any{"error": "not_found"})
+		return
+	}
+	if ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	_, _ = w.Write(body)
+}
+
 func (gw *Gateway) handleGames(w http.ResponseWriter, r *http.Request) {
 	seen := map[string]bool{}
 	ids := []string{}

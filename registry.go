@@ -26,6 +26,27 @@ func NewRegistryClient(base string) *RegistryClient {
 
 func (r *RegistryClient) configured() bool { return r.base != "" }
 
+// Asset fetches one of a game's uploaded images (Option 1c) from the internal
+// registry, so the browser can load it from the gateway origin (img-src) without
+// the registry being public. Returns the bytes, content type, and HTTP status.
+func (r *RegistryClient) Asset(ctx context.Context, gameID, assetID string) ([]byte, string, int, error) {
+	if !r.configured() {
+		return nil, "", http.StatusNotFound, nil
+	}
+	u := r.base + "/games/" + url.PathEscape(gameID) + "/assets/" + url.PathEscape(assetID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	resp, err := r.hc.Do(req)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512<<10))
+	return body, resp.Header.Get("Content-Type"), resp.StatusCode, nil
+}
+
 // Catalog returns the game ids published to the registry. Best-effort: callers
 // treat any error as "no registry games" and fall back to other sources.
 func (r *RegistryClient) Catalog(ctx context.Context) ([]string, error) {
