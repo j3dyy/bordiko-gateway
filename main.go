@@ -72,8 +72,8 @@ func main() {
 	gw := NewGateway(hub, gh, reg, auth, lobby, ghURL, adminToken, origins)
 
 	addr := env("GATEWAY_ADDR", ":8080")
-	log.Printf("bordiko gateway listening on %s → game-host %s (origins %v; publish %s; turn %s)",
-		addr, ghURL, origins, map[bool]string{true: "enabled", false: "disabled (set ADMIN_TOKEN)"}[adminToken != ""], turnLimit)
+	log.Printf("bordiko gateway %s listening on %s → game-host %s (origins %v; publish %s; turn %s)",
+		buildVersion, addr, ghURL, origins, map[bool]string{true: "enabled", false: "disabled (set ADMIN_TOKEN)"}[adminToken != ""], turnLimit)
 	if err := http.ListenAndServe(addr, gw.Routes()); err != nil {
 		log.Fatalf("gateway failed: %v", err)
 	}
