@@ -518,6 +518,7 @@ type catalogGame struct {
 	RatingCount int     `json:"ratingCount"`
 	Plays       int     `json:"plays"`
 	Live        int     `json:"live"`
+	HasUI       bool    `json:"hasUI"` // ships a custom sandboxed UI bundle → frontend auto-picks it
 }
 
 // handleCatalog builds the marketplace catalog from real data: the registry's
@@ -542,7 +543,7 @@ func (gw *Gateway) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		out = append(out, catalogGame{
 			ID: g.GameID, DisplayName: g.DisplayName, MinPlayers: g.MinPlayers, MaxPlayers: g.MaxPlayers,
 			Board: g.Board, Rating: g.Rating, RatingCount: g.RatingCount,
-			Plays: plays[g.GameID], Live: live[g.GameID],
+			Plays: plays[g.GameID], Live: live[g.GameID], HasUI: g.HasUI,
 		})
 	}
 	// Games the game-host has loaded but the registry doesn't list (e.g. local

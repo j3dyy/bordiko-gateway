@@ -115,6 +115,9 @@ type RegGame struct {
 	// admin flag) reads as enabled, not disabled — otherwise a gateway deployed
 	// ahead of the registry would hide every game. nil ⇒ enabled.
 	Enabled *bool `json:"enabled"`
+	// HasUI is true when the game ships a custom sandboxed UI bundle (Option 2), so
+	// the frontend auto-picks the sandbox renderer. Absent (old registry) ⇒ false.
+	HasUI bool `json:"hasUI"`
 }
 
 // EnabledOrDefault treats a missing enabled flag (old registry) as enabled.
