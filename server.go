@@ -105,7 +105,7 @@ func (gw *Gateway) Routes() http.Handler {
 // buildVersion is bumped on each deploy so a live gateway is verifiable
 // (curl /health) — usectl has served stale images before; this makes it visible
 // AND forces a fresh compile.
-const buildVersion = "2026-07-14-bots"
+const buildVersion = "2026-07-16-admin"
 
 func health(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
