@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 )
 
@@ -34,8 +35,23 @@ func chooseBotMove(gameID string, view json.RawMessage, legal []moveDesc) *moveD
 	if len(legal) == 0 {
 		return nil
 	}
+	// The game-host view is {G: {...game state...}, phase, currentPlayer, ...}. A
+	// bot reasons over the GAME state, so unwrap G before handing it to the
+	// game-specific chooser (whose view structs read the game's own fields).
+	g := view
+	var wrap struct {
+		G json.RawMessage `json:"G"`
+	}
+	if json.Unmarshal(view, &wrap) == nil && len(wrap.G) > 0 {
+		g = wrap.G
+	}
 	if gameID == "jokeri" {
-		if mv := chooseJokeriMove(view, legal); mv != nil {
+		if mv := chooseJokeriMove(g, legal); mv != nil {
+			return mv
+		}
+	}
+	if gameID == "avalon" {
+		if mv := chooseAvalonMove(g, legal); mv != nil {
 			return mv
 		}
 	}
@@ -420,4 +436,180 @@ func jkWinner(trick []jkTrickCard, called, trump string) int {
 		return 0
 	}
 	return best
+}
+
+/* ------------------------------- avalon AI -------------------------------- */
+
+// A role-aware Avalon bot. It reasons over the SAME redacted board a human sees,
+// so it only knows what its role is allowed to know: its own faction always, and
+// (for evil, and for Merlin) the seats it can see the allegiance of. Good bots
+// approve teams with no visible evil and always play Success; evil bots get on
+// teams, approve teams carrying an evil, fail quests, and — as the Assassin —
+// guess a seat they DON'T know to be evil (their partners can't be Merlin).
+
+const avTeamEvil = "#D83A34" // TEAM_EVIL in games/avalon: a seat the viewer sees as evil
+
+type avSeat struct {
+	ID     string   `json:"id"`
+	Role   string   `json:"role"`
+	Color  string   `json:"color"`
+	Badges []string `json:"badges"`
+}
+
+type avView struct {
+	Board struct {
+		Status struct {
+			Phase string `json:"phase"`
+		} `json:"status"`
+		Seats  []avSeat `json:"seats"`
+		Tracks []struct {
+			Steps []struct {
+				Label string `json:"label"`
+				State string `json:"state"`
+			} `json:"steps"`
+		} `json:"tracks"`
+	} `json:"board"`
+}
+
+func avContains(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+func chooseAvalonMove(view json.RawMessage, legal []moveDesc) *moveDesc {
+	var v avView
+	if err := json.Unmarshal(view, &v); err != nil {
+		return nil
+	}
+	var me *avSeat
+	for i := range v.Board.Seats {
+		if avContains(v.Board.Seats[i].Badges, "You") {
+			me = &v.Board.Seats[i]
+		}
+	}
+	iAmEvil := me != nil && me.Color == avTeamEvil
+
+	switch v.Board.Status.Phase {
+	case "night":
+		return &legal[0] // only "ready" is legal — acknowledge and move on
+	case "team":
+		return avPropose(&v, me, iAmEvil, legal)
+	case "vote":
+		return avVote(&v, iAmEvil, legal)
+	case "quest":
+		return avQuestMove(legal, !iAmEvil) // good must succeed; evil fails to sink it
+	case "assassin":
+		return avAssassinate(&v, legal)
+	}
+	return nil
+}
+
+// avQuestSize reads the current quest's required team size off the quest track.
+func avQuestSize(v *avView) int {
+	for _, t := range v.Board.Tracks {
+		for _, s := range t.Steps {
+			if s.State == "current" {
+				if n, err := strconv.Atoi(s.Label); err == nil {
+					return n
+				}
+			}
+		}
+	}
+	return 0
+}
+
+// avPropose builds a team of the required size: always include self, then good
+// prefers seats it does NOT see as evil, while evil seeds one visible partner (a
+// guaranteed fail) before filling the rest.
+func avPropose(v *avView, me *avSeat, iAmEvil bool, legal []moveDesc) *moveDesc {
+	size := avQuestSize(v)
+	if size <= 0 || me == nil {
+		return &legal[0]
+	}
+	team := []string{me.ID}
+	var pref, rest []string
+	for _, s := range v.Board.Seats {
+		if s.ID == me.ID {
+			continue
+		}
+		evilSeat := s.Color == avTeamEvil
+		if (iAmEvil && evilSeat) || (!iAmEvil && !evilSeat) {
+			pref = append(pref, s.ID)
+		} else {
+			rest = append(rest, s.ID)
+		}
+	}
+	for _, id := range append(pref, rest...) {
+		if len(team) >= size {
+			break
+		}
+		team = append(team, id)
+	}
+	if len(team) != size {
+		return &legal[0]
+	}
+	payload, _ := json.Marshal(map[string]any{"players": team})
+	return &moveDesc{Type: "proposeTeam", Payload: payload}
+}
+
+// avVote: good approves a team with no visible evil; evil approves a team that
+// carries an evil it can see (itself or a partner), else rejects.
+func avVote(v *avView, iAmEvil bool, legal []moveDesc) *moveDesc {
+	teamHasEvil := false
+	for _, s := range v.Board.Seats {
+		if avContains(s.Badges, "On team") || avContains(s.Badges, "On quest") {
+			if s.Color == avTeamEvil {
+				teamHasEvil = true
+			}
+		}
+	}
+	approve := teamHasEvil
+	if !iAmEvil {
+		approve = !teamHasEvil
+	}
+	for i := range legal {
+		var p struct {
+			Approve bool `json:"approve"`
+		}
+		if json.Unmarshal(legal[i].Payload, &p) == nil && p.Approve == approve {
+			return &legal[i]
+		}
+	}
+	return &legal[0]
+}
+
+func avQuestMove(legal []moveDesc, success bool) *moveDesc {
+	for i := range legal {
+		var p struct {
+			Success bool `json:"success"`
+		}
+		if json.Unmarshal(legal[i].Payload, &p) == nil && p.Success == success {
+			return &legal[i]
+		}
+	}
+	return &legal[0]
+}
+
+// avAssassinate guesses Merlin among the seats the Assassin does NOT already know
+// to be evil (its partners can't be Merlin).
+func avAssassinate(v *avView, legal []moveDesc) *moveDesc {
+	evilIDs := map[string]bool{}
+	for _, s := range v.Board.Seats {
+		if s.Color == avTeamEvil {
+			evilIDs[s.ID] = true
+		}
+	}
+	for i := range legal {
+		var p struct {
+			Target string `json:"target"`
+		}
+		if json.Unmarshal(legal[i].Payload, &p) == nil && !evilIDs[p.Target] {
+			return &legal[i]
+		}
+	}
+	return &legal[0]
 }

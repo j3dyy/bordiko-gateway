@@ -170,3 +170,119 @@ func TestChooseBotMoveDefaultFirstLegal(t *testing.T) {
 }
 
 func intp(n int) *int { return &n }
+
+/* ------------------------------- avalon bot ------------------------------- */
+
+// avBoard builds the unwrapped Avalon game state (G) the chooser receives — i.e.
+// { board: {...} } — matching what chooseBotMove passes after peeling off the
+// view wrapper.
+func avBoard(phase string, seats []avSeat, curStep string) json.RawMessage {
+	board := map[string]any{
+		"status": map[string]any{"phase": phase},
+		"seats":  seats,
+		"tracks": []any{map[string]any{"steps": []any{
+			map[string]any{"label": curStep, "state": "current"},
+		}}},
+	}
+	b, _ := json.Marshal(map[string]any{"board": board})
+	return b
+}
+
+var voteLegal = []moveDesc{mv("vote", map[string]any{"approve": true}), mv("vote", map[string]any{"approve": false})}
+
+func voted(got *moveDesc) bool {
+	var p struct{ Approve bool `json:"approve"` }
+	_ = json.Unmarshal(got.Payload, &p)
+	return p.Approve
+}
+
+func TestAvalonGoodApprovesCleanTeam(t *testing.T) {
+	// A good bot (no evil visible) approves a team with no evil on it.
+	view := avBoard("vote", []avSeat{
+		{ID: "a", Color: "", Badges: []string{"You"}},
+		{ID: "b", Badges: []string{"On team"}},
+		{ID: "c", Badges: []string{"On team"}},
+	}, "2")
+	if !voted(chooseAvalonMove(view, voteLegal)) {
+		t.Fatal("good should approve a team with no visible evil")
+	}
+}
+
+func TestAvalonEvilApprovesTeamWithPartner(t *testing.T) {
+	// An evil bot approves a team carrying a visible evil partner...
+	yes := avBoard("vote", []avSeat{
+		{ID: "a", Color: avTeamEvil, Badges: []string{"You"}},
+		{ID: "b", Color: avTeamEvil, Badges: []string{"On team"}}, // partner on the team
+		{ID: "c", Badges: []string{"On team"}},
+	}, "2")
+	if !voted(chooseAvalonMove(yes, voteLegal)) {
+		t.Fatal("evil should approve a team with an evil on it")
+	}
+	// ...and rejects a team with no evil on it.
+	no := avBoard("vote", []avSeat{
+		{ID: "a", Color: avTeamEvil, Badges: []string{"You"}},
+		{ID: "b", Badges: []string{"On team"}},
+		{ID: "c", Badges: []string{"On team"}},
+	}, "2")
+	if voted(chooseAvalonMove(no, voteLegal)) {
+		t.Fatal("evil should reject a team with no evil on it")
+	}
+}
+
+func TestAvalonQuestPlay(t *testing.T) {
+	success := func(got *moveDesc) bool {
+		var p struct{ Success bool `json:"success"` }
+		_ = json.Unmarshal(got.Payload, &p)
+		return p.Success
+	}
+	// Good plays Success (its only option).
+	good := avBoard("quest", []avSeat{{ID: "a", Badges: []string{"You", "On quest"}}}, "2")
+	if !success(chooseAvalonMove(good, []moveDesc{mv("questCard", map[string]any{"success": true})})) {
+		t.Fatal("good must play success")
+	}
+	// Evil fails the quest to sink it.
+	evil := avBoard("quest", []avSeat{{ID: "a", Color: avTeamEvil, Badges: []string{"You", "On quest"}}}, "2")
+	got := chooseAvalonMove(evil, []moveDesc{mv("questCard", map[string]any{"success": true}), mv("questCard", map[string]any{"success": false})})
+	if success(got) {
+		t.Fatal("evil should fail the quest")
+	}
+}
+
+func TestAvalonAssassinAvoidsKnownEvil(t *testing.T) {
+	// The Assassin sees b as a partner; it must NOT name a known-evil seat.
+	view := avBoard("assassin", []avSeat{
+		{ID: "a", Color: avTeamEvil, Badges: []string{"You"}},
+		{ID: "b", Color: avTeamEvil},
+		{ID: "c"},
+		{ID: "d"},
+	}, "3")
+	legal := []moveDesc{mv("assassinate", map[string]any{"target": "b"}), mv("assassinate", map[string]any{"target": "c"}), mv("assassinate", map[string]any{"target": "d"})}
+	got := chooseAvalonMove(view, legal)
+	var p struct{ Target string `json:"target"` }
+	_ = json.Unmarshal(got.Payload, &p)
+	if p.Target == "b" {
+		t.Fatalf("assassin named a known-evil partner %q", p.Target)
+	}
+}
+
+func TestAvalonProposeFullTeamWithSelf(t *testing.T) {
+	view := avBoard("team", []avSeat{
+		{ID: "a", Badges: []string{"You"}},
+		{ID: "b"}, {ID: "c"}, {ID: "d"}, {ID: "e"},
+	}, "3")
+	got := chooseAvalonMove(view, []moveDesc{mv("proposeTeam", map[string]any{"players": []string{}})})
+	var p struct{ Players []string `json:"players"` }
+	_ = json.Unmarshal(got.Payload, &p)
+	if len(p.Players) != 3 {
+		t.Fatalf("expected a team of 3, got %v", p.Players)
+	}
+	found := false
+	for _, x := range p.Players {
+		if x == "a" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("leader should put itself on the team: %v", p.Players)
+	}
+}

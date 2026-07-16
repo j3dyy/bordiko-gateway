@@ -28,10 +28,25 @@ type MatchMeta struct {
 	GameID        string          `json:"gameId"`
 	Players       []string        `json:"players"`
 	CurrentPlayer string          `json:"currentPlayer"`
+	Active        []string        `json:"active"` // simultaneous mode: seats allowed to act at once
 	Turn          int             `json:"turn"`
 	MoveCount     int             `json:"moveCount"`
 	Ended         bool            `json:"ended"`
 	Result        json.RawMessage `json:"result"`
+}
+
+// IsActive reports whether a seat may act right now: the single current player,
+// or any seat in the simultaneous active set.
+func (m MatchMeta) IsActive(playerID string) bool {
+	if m.CurrentPlayer == playerID {
+		return true
+	}
+	for _, p := range m.Active {
+		if p == playerID {
+			return true
+		}
+	}
+	return false
 }
 
 type ApplyResp struct {
@@ -204,9 +219,14 @@ func (g *GameHostClient) GetView(ctx context.Context, id, playerID string) (json
 	return body, err
 }
 
-// GetLegalMoves returns just the moves array for the current player.
-func (g *GameHostClient) GetLegalMoves(ctx context.Context, id string) (json.RawMessage, error) {
-	body, _, err := g.do(ctx, http.MethodGet, "/matches/"+id+"/legal", nil)
+// GetLegalMoves fetches a seat's legal moves. A non-empty playerID asks for that
+// specific seat (simultaneous stages); empty means the current player.
+func (g *GameHostClient) GetLegalMoves(ctx context.Context, id, playerID string) (json.RawMessage, error) {
+	path := "/matches/" + id + "/legal"
+	if playerID != "" {
+		path += "?playerId=" + url.QueryEscape(playerID)
+	}
+	body, _, err := g.do(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}

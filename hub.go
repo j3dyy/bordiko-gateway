@@ -220,10 +220,13 @@ func (h *Hub) stateMessage(ctx context.Context, matchID string, c *Client, meta 
 	if len(names) > 0 {
 		obj["names"] = mustJSON(names) // player id → display name, for labelling the board
 	}
-	yourTurn := !meta.Ended && meta.CurrentPlayer == c.playerID
+	// yourTurn is true for the current player OR — in simultaneous mode — any seat
+	// in the active set (a shared vote / night acknowledge / quest). Legal moves are
+	// fetched for THIS seat, not the global current player.
+	yourTurn := !meta.Ended && meta.IsActive(c.playerID)
 	obj["yourTurn"] = mustJSON(yourTurn)
 	if yourTurn {
-		if legal, err := h.gh.GetLegalMoves(ctx, matchID); err == nil {
+		if legal, err := h.gh.GetLegalMoves(ctx, matchID, c.playerID); err == nil {
 			obj["legalMoves"] = legal
 		}
 	}
@@ -279,9 +282,22 @@ func (h *Hub) cancelTurn(matchID string) {
 	h.botMu.Unlock()
 }
 
+// actionableSeats is the set of seats that may act right now: the simultaneous
+// active set, or the single current player for an ordinary turn.
+func actionableSeats(meta *MatchMeta) []string {
+	if len(meta.Active) > 0 {
+		return meta.Active
+	}
+	if meta.CurrentPlayer != "" {
+		return []string{meta.CurrentPlayer}
+	}
+	return nil
+}
+
 // onTurnTimeout fires when a turn ran out of time. If it's still the same turn,
 // the match is live, and someone is watching, the hub auto-plays the first legal
-// move for the current player — then broadcasts, which arms the next turn.
+// move for EVERY seat still to act (one seat in an ordinary turn; the whole
+// pending set in a simultaneous stage) — then broadcasts, which arms the next turn.
 func (h *Hub) onTurnTimeout(matchID string, mc int) {
 	if len(h.clientsIn(matchID)) == 0 {
 		h.cancelTurn(matchID)
@@ -292,29 +308,43 @@ func (h *Hub) onTurnTimeout(matchID string, mc int) {
 	if err != nil || meta.Ended || meta.MoveCount != mc {
 		return // stale or already moved/ended
 	}
-	legal, err := h.gh.GetLegalMoves(ctx, matchID)
+	played := false
+	for _, seat := range actionableSeats(meta) {
+		if mv, ok := h.autoPlaySeat(ctx, matchID, seat); ok {
+			played = true
+			notice := mustJSON(map[string]any{"t": "turn_timeout", "matchId": matchID, "player": seat, "auto": mv})
+			for _, c := range h.clientsIn(matchID) {
+				c.trySend(notice)
+			}
+		}
+	}
+	if played {
+		h.broadcastState(ctx, matchID, nil)
+	}
+}
+
+// autoPlaySeat plays the first legal move for one seat (used on timeout). Returns
+// the move type and whether it applied — a seat with no legal moves (already
+// acted, or the phase moved on) is skipped.
+func (h *Hub) autoPlaySeat(ctx context.Context, matchID, seat string) (string, bool) {
+	legal, err := h.gh.GetLegalMoves(ctx, matchID, seat)
 	if err != nil {
-		return
+		return "", false
 	}
 	var moves []struct {
 		Type    string          `json:"type"`
 		Payload json.RawMessage `json:"payload"`
 	}
 	if err := json.Unmarshal(legal, &moves); err != nil || len(moves) == 0 {
-		return
+		return "", false
 	}
-	pick := moves[0] // first legal move: Pass on a bid, No-trump on trump, a card on play
-	res, status, err := h.gh.ApplyMove(ctx, matchID, meta.CurrentPlayer, pick.Type, pick.Payload)
+	pick := moves[0] // first legal move: Pass on a bid, No-trump on trump, ready/approve, a card
+	res, status, err := h.gh.ApplyMove(ctx, matchID, seat, pick.Type, pick.Payload)
 	if err != nil || status == 422 || res == nil || !res.OK {
-		log.Printf("turn timeout auto-move %s (%s): status=%d err=%v", matchID, meta.CurrentPlayer, status, err)
-		return
+		log.Printf("turn timeout auto-move %s (%s): status=%d err=%v", matchID, seat, status, err)
+		return "", false
 	}
-	// Tell the room whose turn was auto-played, then broadcast the new state.
-	notice := mustJSON(map[string]any{"t": "turn_timeout", "matchId": matchID, "player": meta.CurrentPlayer, "auto": pick.Type})
-	for _, c := range h.clientsIn(matchID) {
-		c.trySend(notice)
-	}
-	h.broadcastState(ctx, matchID, res.Events)
+	return pick.Type, true
 }
 
 /* --------------------------------- bots ----------------------------------- */
@@ -332,8 +362,19 @@ func botDisplayName(id string) string {
 // (e.g. a reconnect) won't double-schedule. When the bot plays it broadcasts,
 // which calls this again for the next actor — so a run of consecutive bot seats
 // resolves one visible move at a time until a human is on turn or the hand ends.
+// pendingBotSeat returns a bot seat that may act right now (the current player, or
+// any bot in the simultaneous active set), or "" if no bot is on to act.
+func pendingBotSeat(meta *MatchMeta) string {
+	for _, s := range actionableSeats(meta) {
+		if isBot(s) {
+			return s
+		}
+	}
+	return ""
+}
+
 func (h *Hub) maybeDriveBot(matchID string, meta *MatchMeta) {
-	if meta.Ended || !isBot(meta.CurrentPlayer) {
+	if meta.Ended || pendingBotSeat(meta) == "" {
 		return
 	}
 	if len(h.clientsIn(matchID)) == 0 {
@@ -359,14 +400,18 @@ func (h *Hub) driveBot(matchID string, mc int) {
 	}
 	ctx := context.Background()
 	meta, err := h.gh.GetMatch(ctx, matchID)
-	if err != nil || meta.Ended || meta.MoveCount != mc || !isBot(meta.CurrentPlayer) {
-		return // stale, ended, already moved, or no longer a bot's turn
+	if err != nil || meta.Ended || meta.MoveCount != mc {
+		return // stale, ended, or already moved
 	}
-	view, err := h.gh.GetView(ctx, matchID, meta.CurrentPlayer)
+	bot := pendingBotSeat(meta)
+	if bot == "" {
+		return // no longer a bot's turn
+	}
+	view, err := h.gh.GetView(ctx, matchID, bot)
 	if err != nil {
 		return
 	}
-	legalRaw, err := h.gh.GetLegalMoves(ctx, matchID)
+	legalRaw, err := h.gh.GetLegalMoves(ctx, matchID, bot)
 	if err != nil {
 		return
 	}
@@ -378,9 +423,9 @@ func (h *Hub) driveBot(matchID string, mc int) {
 	if pick == nil {
 		return
 	}
-	res, status, err := h.gh.ApplyMove(ctx, matchID, meta.CurrentPlayer, pick.Type, pick.Payload)
+	res, status, err := h.gh.ApplyMove(ctx, matchID, bot, pick.Type, pick.Payload)
 	if err != nil || status == 422 || res == nil || !res.OK {
-		log.Printf("bot move %s (%s): status=%d err=%v", matchID, meta.CurrentPlayer, status, err)
+		log.Printf("bot move %s (%s): status=%d err=%v", matchID, bot, status, err)
 		return
 	}
 	h.broadcastState(ctx, matchID, res.Events)
