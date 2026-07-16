@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Gateway is the player-facing edge: OAuth + sessions, a lobby for login-required
@@ -77,6 +78,13 @@ func (gw *Gateway) Routes() http.Handler {
 	// so developers can publish over HTTPS while the registry stays private.
 	mux.HandleFunc("POST /api/publish", gw.handlePublish)
 
+	// Admin panel (ADMIN_EMAILS only) — enable/disable games and users. Registered
+	// as explicit patterns so Go's ServeMux matches them ahead of the /api/ proxy.
+	mux.HandleFunc("GET /api/admin/games", gw.requireAdmin(gw.adminListGames))
+	mux.HandleFunc("POST /api/admin/games/{id}/enabled", gw.requireAdmin(gw.adminSetGameEnabled))
+	mux.HandleFunc("GET /api/admin/users", gw.requireAdmin(gw.adminListUsers))
+	mux.HandleFunc("POST /api/admin/users/{id}/disabled", gw.requireAdmin(gw.adminSetUserDisabled))
+
 	// Leave an in-progress match (login required) — the leaver's team forfeits so
 	// the others aren't stuck, and everyone is freed to start a new game.
 	mux.HandleFunc("POST /api/matches/{id}/leave", gw.requireAuth(gw.leaveMatch))
@@ -107,7 +115,9 @@ func health(w http.ResponseWriter, _ *http.Request) {
 /* --------------------------------- auth ----------------------------------- */
 
 // requireAuth wraps a handler so it only runs for a signed-in user, passing the
-// verified session claims through.
+// verified session claims through. A disabled account is rejected on its next
+// request (403) — the block that a disable applies without a session-revocation
+// list.
 func (gw *Gateway) requireAuth(h func(http.ResponseWriter, *http.Request, *sessionClaims)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := gw.auth.sessionUser(r)
@@ -115,8 +125,24 @@ func (gw *Gateway) requireAuth(h func(http.ResponseWriter, *http.Request, *sessi
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "login_required"})
 			return
 		}
+		if gw.auth.IsDisabled(r.Context(), claims.Sub) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "account_disabled"})
+			return
+		}
 		h(w, r, claims)
 	}
+}
+
+// requireAdmin wraps a handler so it only runs for a signed-in ADMIN (their email
+// or id is in ADMIN_EMAILS). Non-admins get 403.
+func (gw *Gateway) requireAdmin(h func(http.ResponseWriter, *http.Request, *sessionClaims)) http.HandlerFunc {
+	return gw.requireAuth(func(w http.ResponseWriter, r *http.Request, claims *sessionClaims) {
+		if !gw.auth.IsAdmin(r.Context(), claims) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "admin_required"})
+			return
+		}
+		h(w, r, claims)
+	})
 }
 
 /* --------------------------------- lobby ---------------------------------- */
@@ -137,6 +163,10 @@ func (gw *Gateway) createLobby(w http.ResponseWriter, r *http.Request, u *sessio
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.GameID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_request", "message": "gameId required"})
+		return
+	}
+	if gw.disabledGames(r.Context())[req.GameID] {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "game_disabled", "message": "this game is currently unavailable"})
 		return
 	}
 	if gw.blockIfInGame(w, r, u) {
@@ -455,11 +485,12 @@ func (gw *Gateway) handleAsset(w http.ResponseWriter, r *http.Request) {
 }
 
 func (gw *Gateway) handleGames(w http.ResponseWriter, r *http.Request) {
+	disabled := gw.disabledGames(r.Context())
 	seen := map[string]bool{}
 	ids := []string{}
 	add := func(list []string) {
 		for _, id := range list {
-			if id != "" && !seen[id] {
+			if id != "" && !seen[id] && !disabled[id] {
 				seen[id] = true
 				ids = append(ids, id)
 			}
@@ -500,8 +531,13 @@ func (gw *Gateway) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		live[l.GameID]++
 	}
 	seen := map[string]bool{}
+	disabled := map[string]bool{}
 	out := []catalogGame{}
 	for _, g := range reg {
+		if !g.EnabledOrDefault() {
+			disabled[g.GameID] = true
+			continue // a disabled game is hidden from players
+		}
 		seen[g.GameID] = true
 		out = append(out, catalogGame{
 			ID: g.GameID, DisplayName: g.DisplayName, MinPlayers: g.MinPlayers, MaxPlayers: g.MaxPlayers,
@@ -510,10 +546,10 @@ func (gw *Gateway) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	// Games the game-host has loaded but the registry doesn't list (e.g. local
-	// dist in dev) still appear.
+	// dist in dev) still appear — unless an admin disabled them.
 	if gh, err := gw.gh.ListGames(r.Context()); err == nil {
 		for _, id := range gh {
-			if !seen[id] {
+			if !seen[id] && !disabled[id] {
 				seen[id] = true
 				out = append(out, catalogGame{ID: id, Plays: plays[id], Live: live[id]})
 			}
@@ -579,6 +615,112 @@ func (gw *Gateway) handlePublish(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(respBody)
+}
+
+/* --------------------------------- admin ---------------------------------- */
+
+// adminListGames returns every published game with its enabled flag, so the admin
+// panel can toggle each one (disabled games are hidden from players but shown here).
+func (gw *Gateway) adminListGames(w http.ResponseWriter, r *http.Request, _ *sessionClaims) {
+	games, err := gw.reg.CatalogFull(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "registry_unavailable", "message": err.Error()})
+		return
+	}
+	type row struct {
+		ID          string `json:"id"`
+		DisplayName string `json:"displayName"`
+		MinPlayers  int    `json:"minPlayers"`
+		MaxPlayers  int    `json:"maxPlayers"`
+		Enabled     bool   `json:"enabled"`
+	}
+	out := make([]row, 0, len(games))
+	for _, g := range games {
+		out = append(out, row{ID: g.GameID, DisplayName: g.DisplayName, MinPlayers: g.MinPlayers, MaxPlayers: g.MaxPlayers, Enabled: g.EnabledOrDefault()})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	writeJSON(w, http.StatusOK, map[string]any{"games": out})
+}
+
+// disabledGames returns the set of game ids an admin has disabled, so the public
+// catalog can hide them and lobby-create can block them. Best-effort: on a
+// registry error it returns an empty set (nothing hidden) rather than hiding all.
+func (gw *Gateway) disabledGames(ctx context.Context) map[string]bool {
+	out := map[string]bool{}
+	games, err := gw.reg.CatalogFull(ctx)
+	if err != nil {
+		return out
+	}
+	for _, g := range games {
+		if !g.EnabledOrDefault() {
+			out[g.GameID] = true
+		}
+	}
+	return out
+}
+
+func (gw *Gateway) adminSetGameEnabled(w http.ResponseWriter, r *http.Request, _ *sessionClaims) {
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_request"})
+		return
+	}
+	status, resp, err := gw.reg.SetGameEnabled(r.Context(), r.PathValue("id"), body.Enabled)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "registry_unavailable", "message": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(resp)
+}
+
+// adminListUsers lists accounts (newest first) with their disabled flag and email,
+// so an admin can see who's who. Email is exposed only on this admin-guarded route.
+func (gw *Gateway) adminListUsers(w http.ResponseWriter, r *http.Request, _ *sessionClaims) {
+	users, err := gw.auth.users.List(r.Context(), 500)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "store_error", "message": err.Error()})
+		return
+	}
+	type row struct {
+		ID          string    `json:"id"`
+		DisplayName string    `json:"displayName"`
+		Email       string    `json:"email"`
+		Provider    string    `json:"provider"`
+		Disabled    bool      `json:"disabled"`
+		Admin       bool      `json:"admin"`
+		CreatedAt   time.Time `json:"createdAt"`
+	}
+	out := make([]row, 0, len(users))
+	for _, u := range users {
+		out = append(out, row{ID: u.ID, DisplayName: u.DisplayName, Email: u.Email, Provider: u.Provider,
+			Disabled: u.Disabled, Admin: gw.auth.IsAdminUser(u), CreatedAt: u.CreatedAt})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"users": out})
+}
+
+func (gw *Gateway) adminSetUserDisabled(w http.ResponseWriter, r *http.Request, actor *sessionClaims) {
+	var body struct {
+		Disabled bool `json:"disabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad_request"})
+		return
+	}
+	target := r.PathValue("id")
+	// Guard against locking yourself out: an admin can't disable their own account.
+	if body.Disabled && target == actor.Sub {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "cannot_disable_self"})
+		return
+	}
+	if err := gw.auth.users.SetDisabled(r.Context(), target, body.Disabled); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "store_error", "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": target, "disabled": body.Disabled})
 }
 
 /* ---------------------------------- CORS ---------------------------------- */

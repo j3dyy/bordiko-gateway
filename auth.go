@@ -30,6 +30,7 @@ type Auth struct {
 	frontendURL  string // where to send the browser after login
 	cookieSecure bool
 	devEnabled   bool
+	admins       map[string]bool // ADMIN_EMAILS: matched against an account's email OR its id
 	providers    map[string]*oauthProvider
 	hc           *http.Client
 }
@@ -48,6 +49,7 @@ func NewAuth(users UserStore) *Auth {
 		frontendURL:  strings.TrimRight(env("FRONTEND_URL", "http://localhost:5173"), "/"),
 		cookieSecure: os.Getenv("COOKIE_SECURE") == "true",
 		devEnabled:   env("AUTH_DEV_ENABLED", "true") == "true",
+		admins:       parseAdmins(os.Getenv("ADMIN_EMAILS")),
 		providers:    map[string]*oauthProvider{},
 		hc:           &http.Client{Timeout: 15 * time.Second},
 	}
@@ -57,8 +59,54 @@ func NewAuth(users UserStore) *Auth {
 	if p := githubProvider(os.Getenv("GITHUB_CLIENT_ID"), os.Getenv("GITHUB_CLIENT_SECRET")); p.configured() {
 		a.providers["github"] = p
 	}
-	log.Printf("auth: providers=%v dev-login=%v frontend=%s", a.providerNames(), a.devEnabled, a.frontendURL)
+	log.Printf("auth: providers=%v dev-login=%v frontend=%s admins=%d", a.providerNames(), a.devEnabled, a.frontendURL, len(a.admins))
 	return a
+}
+
+// parseAdmins turns a comma-separated ADMIN_EMAILS into a lookup set. Entries are
+// lower-cased and trimmed; an entry may be an account email (e.g.
+// "me@example.com") or a raw user id (e.g. "dev:alice") — IsAdmin matches either.
+func parseAdmins(raw string) map[string]bool {
+	set := map[string]bool{}
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.ToLower(strings.TrimSpace(p)); p != "" {
+			set[p] = true
+		}
+	}
+	return set
+}
+
+// IsAdmin reports whether the signed-in user is an admin. The session cookie holds
+// only the user id, so email-based matching needs an account lookup; a raw-id
+// entry in ADMIN_EMAILS is matched without one (handy for dev login).
+func (a *Auth) IsAdmin(ctx context.Context, claims *sessionClaims) bool {
+	if len(a.admins) == 0 || claims == nil {
+		return false
+	}
+	if a.admins[strings.ToLower(claims.Sub)] {
+		return true
+	}
+	if u, err := a.users.Get(ctx, claims.Sub); err == nil {
+		return a.IsAdminUser(u)
+	}
+	return false
+}
+
+// IsAdminUser reports whether an already-loaded account is an admin — matched by
+// email or id — without a DB round-trip (used when listing users).
+func (a *Auth) IsAdminUser(u *User) bool {
+	if len(a.admins) == 0 || u == nil {
+		return false
+	}
+	return a.admins[strings.ToLower(u.ID)] || (u.Email != "" && a.admins[strings.ToLower(u.Email)])
+}
+
+// IsDisabled reports whether an account has been disabled by an admin. It fails
+// open: a lookup error (DB blip, unknown id) is treated as "not disabled" so a
+// transient failure can't lock everyone out — only an explicit flag blocks.
+func (a *Auth) IsDisabled(ctx context.Context, id string) bool {
+	u, err := a.users.Get(ctx, id)
+	return err == nil && u.Disabled
 }
 
 func (a *Auth) providerNames() []string {
@@ -115,6 +163,8 @@ func (a *Auth) handleMe(w http.ResponseWriter, r *http.Request) {
 		"id":          claims.Sub,
 		"displayName": claims.Name,
 		"avatarUrl":   claims.Avatar,
+		"isAdmin":     a.IsAdmin(r.Context(), claims),
+		"disabled":    a.IsDisabled(r.Context(), claims.Sub),
 	})
 }
 

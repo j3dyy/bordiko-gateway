@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -23,6 +24,7 @@ type User struct {
 	DisplayName string    `json:"displayName"`
 	AvatarURL   string    `json:"avatarUrl"`
 	Email       string    `json:"-"`
+	Disabled    bool      `json:"-"` // an admin can disable an account; blocked from playing
 	CreatedAt   time.Time `json:"createdAt"`
 }
 
@@ -34,8 +36,13 @@ type UserStore interface {
 	// SetDisplayName updates just the chosen display name (a login Upsert never
 	// overwrites it, so a custom name survives re-login).
 	SetDisplayName(ctx context.Context, id, name string) error
+	// SetDisabled enables/disables an account (admin action). A disabled account
+	// survives re-login (Upsert never clears it).
+	SetDisabled(ctx context.Context, id string, disabled bool) error
 	Get(ctx context.Context, id string) (*User, error)
 	GetMany(ctx context.Context, ids []string) (map[string]*User, error)
+	// List returns up to limit accounts, newest first — for the admin panel.
+	List(ctx context.Context, limit int) ([]*User, error)
 	Close() error
 }
 
@@ -55,9 +62,10 @@ func (s *MemoryUserStore) Upsert(_ context.Context, u *User) error {
 	defer s.mu.Unlock()
 	if existing, ok := s.users[u.ID]; ok {
 		// Preserve creation time AND a user-chosen display name (login must not
-		// clobber it); refresh the other profile fields.
+		// clobber it); a disable set by an admin must also survive re-login.
 		u.CreatedAt = existing.CreatedAt
 		u.DisplayName = existing.DisplayName
+		u.Disabled = existing.Disabled
 	} else if u.CreatedAt.IsZero() {
 		u.CreatedAt = time.Now()
 	}
@@ -73,6 +81,30 @@ func (s *MemoryUserStore) SetDisplayName(_ context.Context, id, name string) err
 		u.DisplayName = name
 	}
 	return nil
+}
+
+func (s *MemoryUserStore) SetDisabled(_ context.Context, id string, disabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if u, ok := s.users[id]; ok {
+		u.Disabled = disabled
+	}
+	return nil
+}
+
+func (s *MemoryUserStore) List(_ context.Context, limit int) ([]*User, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*User, 0, len(s.users))
+	for _, u := range s.users {
+		cp := *u
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 func (s *MemoryUserStore) Get(_ context.Context, id string) (*User, error) {
@@ -116,8 +148,10 @@ CREATE TABLE IF NOT EXISTS users (
     display_name text NOT NULL,
     avatar_url   text NOT NULL DEFAULT '',
     email        text NOT NULL DEFAULT '',
+    disabled     boolean NOT NULL DEFAULT false,
     created_at   timestamptz NOT NULL DEFAULT now()
-);`
+);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled boolean NOT NULL DEFAULT false;`
 
 func NewPostgresUserStore(ctx context.Context, url string) (*PostgresUserStore, error) {
 	pool, err := pgxpool.New(ctx, url)
@@ -152,12 +186,17 @@ func (s *PostgresUserStore) SetDisplayName(ctx context.Context, id, name string)
 	return err
 }
 
+func (s *PostgresUserStore) SetDisabled(ctx context.Context, id string, disabled bool) error {
+	_, err := s.pool.Exec(ctx, `UPDATE users SET disabled=$2 WHERE id=$1`, id, disabled)
+	return err
+}
+
 func (s *PostgresUserStore) Get(ctx context.Context, id string) (*User, error) {
 	var u User
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, provider, provider_id, display_name, avatar_url, email, created_at
+		`SELECT id, provider, provider_id, display_name, avatar_url, email, disabled, created_at
 		 FROM users WHERE id = $1`, id).
-		Scan(&u.ID, &u.Provider, &u.ProviderID, &u.DisplayName, &u.AvatarURL, &u.Email, &u.CreatedAt)
+		Scan(&u.ID, &u.Provider, &u.ProviderID, &u.DisplayName, &u.AvatarURL, &u.Email, &u.Disabled, &u.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrUserNotFound
 	}
@@ -173,7 +212,7 @@ func (s *PostgresUserStore) GetMany(ctx context.Context, ids []string) (map[stri
 		return out, nil
 	}
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, provider, provider_id, display_name, avatar_url, email, created_at
+		`SELECT id, provider, provider_id, display_name, avatar_url, email, disabled, created_at
 		 FROM users WHERE id = ANY($1)`, ids)
 	if err != nil {
 		return nil, err
@@ -181,11 +220,34 @@ func (s *PostgresUserStore) GetMany(ctx context.Context, ids []string) (map[stri
 	defer rows.Close()
 	for rows.Next() {
 		var u User
-		if err := rows.Scan(&u.ID, &u.Provider, &u.ProviderID, &u.DisplayName, &u.AvatarURL, &u.Email, &u.CreatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Provider, &u.ProviderID, &u.DisplayName, &u.AvatarURL, &u.Email, &u.Disabled, &u.CreatedAt); err != nil {
 			continue
 		}
 		cp := u
 		out[u.ID] = &cp
+	}
+	return out, nil
+}
+
+func (s *PostgresUserStore) List(ctx context.Context, limit int) ([]*User, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, provider, provider_id, display_name, avatar_url, email, disabled, created_at
+		 FROM users ORDER BY created_at DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*User{}
+	for rows.Next() {
+		var u User
+		if err := rows.Scan(&u.ID, &u.Provider, &u.ProviderID, &u.DisplayName, &u.AvatarURL, &u.Email, &u.Disabled, &u.CreatedAt); err != nil {
+			continue
+		}
+		cp := u
+		out = append(out, &cp)
 	}
 	return out, nil
 }

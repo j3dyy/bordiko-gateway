@@ -111,7 +111,14 @@ type RegGame struct {
 	MaxPlayers  int     `json:"maxPlayers"`
 	Rating      float64 `json:"rating"`
 	RatingCount int     `json:"ratingCount"`
+	// Enabled is a pointer so "field absent" (an older registry that predates the
+	// admin flag) reads as enabled, not disabled — otherwise a gateway deployed
+	// ahead of the registry would hide every game. nil ⇒ enabled.
+	Enabled *bool `json:"enabled"`
 }
+
+// EnabledOrDefault treats a missing enabled flag (old registry) as enabled.
+func (g RegGame) EnabledOrDefault() bool { return g.Enabled == nil || *g.Enabled }
 
 // CatalogFull returns the registry's published games with metadata + ratings.
 func (r *RegistryClient) CatalogFull(ctx context.Context) ([]RegGame, error) {
@@ -137,6 +144,27 @@ func (r *RegistryClient) CatalogFull(ctx context.Context) ([]RegGame, error) {
 		return nil, err
 	}
 	return wrap.Games, nil
+}
+
+// SetGameEnabled enables/disables a whole game in the registry (admin action).
+// Returns the registry's status + body verbatim.
+func (r *RegistryClient) SetGameEnabled(ctx context.Context, gameID string, enabled bool) (int, []byte, error) {
+	if !r.configured() {
+		return 0, nil, fmt.Errorf("registry not configured")
+	}
+	payload, _ := json.Marshal(map[string]any{"enabled": enabled})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.base+"/games/"+url.PathEscape(gameID)+"/enabled", bytes.NewReader(payload))
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := r.hc.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	return resp.StatusCode, data, err
 }
 
 // Rate submits a user's star rating for a game to the registry and returns its

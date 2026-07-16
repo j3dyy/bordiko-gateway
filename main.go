@@ -12,6 +12,7 @@
 //	GAME_HOST_URL     authoritative game-host base           (default "http://localhost:8081")
 //	REGISTRY_URL      internal marketplace registry base     (default "http://localhost:8082")
 //	ADMIN_TOKEN       shared secret enabling POST /api/publish (unset = publishing disabled)
+//	ADMIN_EMAILS      comma-separated admin emails (or user ids) → the admin panel
 //	DATABASE_URL      Postgres DSN for accounts (else in-memory)
 //	SESSION_SECRET    HMAC key for session cookies (else ephemeral)
 //	PUBLIC_URL        gateway's public base for OAuth redirect_uri (default "http://localhost:8080")
