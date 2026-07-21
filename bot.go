@@ -55,7 +55,54 @@ func chooseBotMove(gameID string, view json.RawMessage, legal []moveDesc) *moveD
 			return mv
 		}
 	}
+	if gameID == "kartuli-express" {
+		if mv := chooseKartuliMove(legal); mv != nil {
+			return mv
+		}
+	}
 	return &legal[0] // default / fallback: the first legal move is always safe
+}
+
+/* --------------------------- kartuli-express AI --------------------------- */
+
+// A bot that actually builds a network: resolve any passport keep, otherwise
+// claim the longest route it can afford (most points, and it drains tokens so the
+// game progresses toward its end), and only draw when nothing is claimable. The
+// default "first legal move" would just draw from the deck forever and never
+// claim, so the bot would appear to do nothing.
+func chooseKartuliMove(legal []moveDesc) *moveDesc {
+	// 1) Passport keep decision (setup or Action C): take the first valid keep.
+	for i := range legal {
+		if legal[i].Type == "keepPassports" {
+			return &legal[i]
+		}
+	}
+	// 2) Claim the longest affordable route (cards paid == route length).
+	best := 0
+	var bestMv *moveDesc
+	for i := range legal {
+		if legal[i].Type != "claim" {
+			continue
+		}
+		var p struct {
+			Cards []json.RawMessage `json:"cards"`
+		}
+		_ = json.Unmarshal(legal[i].Payload, &p)
+		if len(p.Cards) > best {
+			best = len(p.Cards)
+			bestMv = &legal[i]
+		}
+	}
+	if bestMv != nil {
+		return bestMv
+	}
+	// 3) Otherwise draw a card (build toward routes); avoid drawing new passports.
+	for i := range legal {
+		if legal[i].Type == "draw" {
+			return &legal[i]
+		}
+	}
+	return &legal[0]
 }
 
 /* ------------------------------- jokeri AI -------------------------------- */

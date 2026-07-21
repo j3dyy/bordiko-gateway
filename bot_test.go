@@ -286,3 +286,40 @@ func TestAvalonProposeFullTeamWithSelf(t *testing.T) {
 		t.Fatalf("leader should put itself on the team: %v", p.Players)
 	}
 }
+
+/* --------------------------- kartuli-express bot -------------------------- */
+
+func TestChooseKartuliPrefersLongestClaim(t *testing.T) {
+	legal := []moveDesc{
+		{Type: "draw", Payload: json.RawMessage(`{"from":"deck"}`)},
+		{Type: "claim", Payload: json.RawMessage(`{"routeId":"short","cards":["red"]}`)},
+		{Type: "claim", Payload: json.RawMessage(`{"routeId":"long","cards":["blue","blue","blue"]}`)},
+		{Type: "requestPassports", Payload: json.RawMessage(`{}`)},
+	}
+	got := chooseBotMove("kartuli-express", json.RawMessage(`{"G":{}}`), legal)
+	if got == nil || got.Type != "claim" {
+		t.Fatalf("want a claim, got %+v", got)
+	}
+	var p struct {
+		RouteID string `json:"routeId"`
+	}
+	_ = json.Unmarshal(got.Payload, &p)
+	if p.RouteID != "long" {
+		t.Fatalf("want the longest route 'long', got %q", p.RouteID)
+	}
+}
+
+func TestChooseKartuliKeepsThenDraws(t *testing.T) {
+	// keep beats everything
+	keep := chooseBotMove("kartuli-express", json.RawMessage(`{"G":{}}`),
+		[]moveDesc{{Type: "draw", Payload: json.RawMessage(`{"from":"deck"}`)}, {Type: "keepPassports", Payload: json.RawMessage(`{"keep":[0,1]}`)}})
+	if keep == nil || keep.Type != "keepPassports" {
+		t.Fatalf("want keepPassports, got %+v", keep)
+	}
+	// with no claim available, draw (not requestPassports)
+	draw := chooseBotMove("kartuli-express", json.RawMessage(`{"G":{}}`),
+		[]moveDesc{{Type: "requestPassports", Payload: json.RawMessage(`{}`)}, {Type: "draw", Payload: json.RawMessage(`{"from":2}`)}})
+	if draw == nil || draw.Type != "draw" {
+		t.Fatalf("want draw over requestPassports, got %+v", draw)
+	}
+}
