@@ -27,6 +27,19 @@ type Hub struct {
 
 	botMu    sync.Mutex
 	botTurns map[string]int // matchID → moveCount already scheduled for a bot
+
+	// Real-time clock. realtimeOf reports a game's fixed tick timestep (ms), or
+	// ok=false for a turn-based game (set by the gateway). ticks holds the running
+	// per-match tick loops. A real-time match is driven forward by this clock (not
+	// by the turn timer / bots) while at least one client is watching.
+	realtimeOf func(gameID string) (dtMs int, ok bool)
+	tickMu     sync.Mutex
+	ticks      map[string]*tickState
+}
+
+// tickState is one match's running real-time clock; closing stop ends it.
+type tickState struct {
+	stop chan struct{}
 }
 
 // botDelay is the pause before a bot plays its turn, so the table can watch each
@@ -49,6 +62,7 @@ func NewHub(gh *GameHostClient, auth *Auth, turnLimit time.Duration) *Hub {
 		turnLimit: turnLimit,
 		turns:     make(map[string]*turnState),
 		botTurns:  make(map[string]int),
+		ticks:     make(map[string]*tickState),
 	}
 }
 
@@ -74,10 +88,12 @@ func (h *Hub) remove(c *Client) {
 		}
 	}
 	h.mu.Unlock()
-	// Nobody is watching → stop auto-playing. The timer re-arms when someone
-	// (re)joins, so a match is never driven forward with an empty room.
+	// Nobody is watching → stop driving the match forward. The turn timer and the
+	// real-time clock both re-arm when someone (re)joins, so a match is never
+	// advanced with an empty room.
 	if empty {
 		h.cancelTurn(c.matchID)
+		h.cancelTick(c.matchID)
 	}
 }
 
@@ -169,6 +185,7 @@ func (h *Hub) broadcastState(ctx context.Context, matchID string, events json.Ra
 	}
 	deadline := h.armTurn(matchID, meta)
 	h.maybeDriveBot(matchID, meta)
+	h.maybeStartTick(matchID, meta)
 	names := h.resolveNames(ctx, matchID, meta.Players)
 	hasEvents := len(events) > 0 && string(events) != "null"
 	for _, c := range h.clientsIn(matchID) {
@@ -243,7 +260,9 @@ func (h *Hub) stateMessage(ctx context.Context, matchID string, c *Client, meta 
 // for the SAME turn keeps the existing deadline, so a mid-turn broadcast (e.g. a
 // client reconnecting) doesn't reset the clock.
 func (h *Hub) armTurn(matchID string, meta *MatchMeta) int64 {
-	if h.turnLimit <= 0 {
+	if h.turnLimit <= 0 || h.isRealtime(meta.GameID) {
+		// Real-time matches are advanced by the tick clock, not the per-turn
+		// auto-play timer — so no turn deadline and no timeout auto-move.
 		return 0
 	}
 	h.tmu.Lock()
@@ -280,6 +299,90 @@ func (h *Hub) cancelTurn(matchID string) {
 	h.botMu.Lock()
 	delete(h.botTurns, matchID)
 	h.botMu.Unlock()
+}
+
+/* ------------------------------ real-time clock --------------------------- */
+
+// isRealtime reports whether a game is real-time (has a tick clock). Safe when no
+// resolver is wired (tests / turn-based-only deployments) — returns false.
+func (h *Hub) isRealtime(gameID string) bool {
+	if h.realtimeOf == nil {
+		return false
+	}
+	_, ok := h.realtimeOf(gameID)
+	return ok
+}
+
+// maybeStartTick arms a match's real-time clock: while at least one client is
+// watching a live real-time match, the host drives its world forward at the
+// game's tick rate. Idempotent — a second watcher (or a rebroadcast) won't start
+// a second loop.
+func (h *Hub) maybeStartTick(matchID string, meta *MatchMeta) {
+	if meta.Ended || h.realtimeOf == nil {
+		return
+	}
+	dtMs, ok := h.realtimeOf(meta.GameID)
+	if !ok || dtMs <= 0 {
+		return
+	}
+	if len(h.clientsIn(matchID)) == 0 {
+		return
+	}
+	h.tickMu.Lock()
+	if _, running := h.ticks[matchID]; running {
+		h.tickMu.Unlock()
+		return
+	}
+	ts := &tickState{stop: make(chan struct{})}
+	h.ticks[matchID] = ts
+	h.tickMu.Unlock()
+	go h.runTicks(matchID, dtMs, ts.stop)
+}
+
+// runTicks is one match's clock goroutine: every dt it advances the world by one
+// fixed step (game-host tick) and broadcasts the new state. It stops when the
+// room empties, the match ends, or the match is gone. A single slow/failed tick
+// is skipped, not fatal — the next tick tries again.
+func (h *Hub) runTicks(matchID string, dtMs int, stop chan struct{}) {
+	interval := time.Duration(dtMs) * time.Millisecond
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			if len(h.clientsIn(matchID)) == 0 {
+				h.cancelTick(matchID)
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), interval+2*time.Second)
+			res, status, err := h.gh.Tick(ctx, matchID, dtMs)
+			cancel()
+			if status == 404 || status == 409 {
+				// Match gone or already ended — nothing more to drive.
+				h.cancelTick(matchID)
+				return
+			}
+			if err != nil || res == nil || !res.OK {
+				continue // transient guest error — skip this frame
+			}
+			h.broadcastState(context.Background(), matchID, res.Events)
+			if res.Ended {
+				h.cancelTick(matchID)
+				return
+			}
+		}
+	}
+}
+
+func (h *Hub) cancelTick(matchID string) {
+	h.tickMu.Lock()
+	if ts := h.ticks[matchID]; ts != nil {
+		close(ts.stop)
+		delete(h.ticks, matchID)
+	}
+	h.tickMu.Unlock()
 }
 
 // actionableSeats is the set of seats that may act right now: the simultaneous
@@ -374,7 +477,7 @@ func pendingBotSeat(meta *MatchMeta) string {
 }
 
 func (h *Hub) maybeDriveBot(matchID string, meta *MatchMeta) {
-	if meta.Ended || pendingBotSeat(meta) == "" {
+	if meta.Ended || h.isRealtime(meta.GameID) || pendingBotSeat(meta) == "" {
 		return
 	}
 	if len(h.clientsIn(matchID)) == 0 {

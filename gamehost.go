@@ -161,6 +161,23 @@ func (g *GameHostClient) ApplyMove(ctx context.Context, id, playerID, mtype stri
 	return &res, status, nil
 }
 
+// Tick advances a real-time match's world by one fixed timestep (dtMs). Returns
+// the parsed result + HTTP status: 200 ok, 422 when the game isn't real-time,
+// 409 when the match already ended. The gateway clock calls this at the game's
+// tickRate; the game-host runs the game's `tick` reducer (no player, no legality).
+func (g *GameHostClient) Tick(ctx context.Context, id string, dtMs int) (*ApplyResp, int, error) {
+	reqBody, _ := json.Marshal(map[string]any{"dt": dtMs})
+	body, status, err := g.do(ctx, http.MethodPost, "/matches/"+url.PathEscape(id)+"/tick", reqBody)
+	if err != nil {
+		return nil, status, err
+	}
+	var res ApplyResp
+	if err := json.Unmarshal(body, &res); err != nil {
+		return nil, status, fmt.Errorf("decode tick: %w", err)
+	}
+	return &res, status, nil
+}
+
 // EndMatch force-ends a match with the given result (used when a player leaves —
 // their team forfeits). Idempotent on the game-host side.
 func (g *GameHostClient) EndMatch(ctx context.Context, id string, result json.RawMessage, by string) error {

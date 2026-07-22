@@ -132,6 +132,9 @@ func (h *Hub) serveWS(w http.ResponseWriter, r *http.Request) {
 	// If it's a bot's turn (e.g. the match just started, or a human reconnects
 	// mid-bot-run), start the bot now that someone is watching.
 	h.maybeDriveBot(matchID, meta)
+	// For a real-time match, start (or keep) its world clock now that someone is
+	// watching — projectiles/platforms advance even with no input.
+	h.maybeStartTick(matchID, meta)
 }
 
 func (c *Client) close() {

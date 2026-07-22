@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,10 +28,47 @@ type Gateway struct {
 	ghURL          string
 	adminToken     string
 	allowedOrigins []string
+
+	// Cache of gameID → fixed tick timestep in ms (0 = known turn-based). Filled
+	// lazily from the registry catalog; used by the hub to decide whether to drive
+	// a real-time clock for a match.
+	rtMu    sync.Mutex
+	rtCache map[string]int
 }
 
 func NewGateway(hub *Hub, gh *GameHostClient, reg *RegistryClient, auth *Auth, lobby *LobbyManager, ghURL, adminToken string, allowedOrigins []string) *Gateway {
-	return &Gateway{hub: hub, gh: gh, reg: reg, auth: auth, lobby: lobby, ghURL: ghURL, adminToken: adminToken, allowedOrigins: allowedOrigins}
+	gw := &Gateway{hub: hub, gh: gh, reg: reg, auth: auth, lobby: lobby, ghURL: ghURL, adminToken: adminToken, allowedOrigins: allowedOrigins, rtCache: map[string]int{}}
+	// Teach the hub how to tell a real-time game (and its tick rate) apart from a
+	// turn-based one, so it drives a clock only for the former.
+	hub.realtimeOf = gw.realtimeTickMs
+	return gw
+}
+
+// realtimeTickMs resolves a game's fixed tick timestep (ms), or ok=false for a
+// turn-based game. Cached; a miss refreshes the whole catalog from the registry
+// (cheap and rare — resolved once per match room, not per tick).
+func (gw *Gateway) realtimeTickMs(gameID string) (int, bool) {
+	gw.rtMu.Lock()
+	if dt, ok := gw.rtCache[gameID]; ok {
+		gw.rtMu.Unlock()
+		return dt, dt > 0
+	}
+	gw.rtMu.Unlock()
+
+	games, err := gw.reg.CatalogFull(context.Background())
+	gw.rtMu.Lock()
+	defer gw.rtMu.Unlock()
+	if err == nil {
+		for _, g := range games {
+			dt := 0
+			if ms, ok := g.RealtimeTickMs(); ok {
+				dt = ms
+			}
+			gw.rtCache[g.GameID] = dt
+		}
+	}
+	dt, ok := gw.rtCache[gameID]
+	return dt, ok && dt > 0
 }
 
 func (gw *Gateway) Routes() http.Handler {

@@ -118,10 +118,46 @@ type RegGame struct {
 	// HasUI is true when the game ships a custom sandboxed UI bundle (Option 2), so
 	// the frontend auto-picks the sandbox renderer. Absent (old registry) ⇒ false.
 	HasUI bool `json:"hasUI"`
+	// Manifest is the game's raw manifest, which the registry already ships in the
+	// catalog. The gateway reads `realtime` out of it to decide whether to drive a
+	// tick clock — so real-time support needs NO registry/game-host change.
+	Manifest json.RawMessage `json:"manifest,omitempty"`
 }
 
 // EnabledOrDefault treats a missing enabled flag (old registry) as enabled.
 func (g RegGame) EnabledOrDefault() bool { return g.Enabled == nil || *g.Enabled }
+
+// maxTickRate caps how fast the host will drive a real-time game's clock (per
+// match). A game may ask for less; anything above is clamped. defaultTickRate is
+// used when a game declares `realtime.tick` but omits a rate.
+const maxTickRate = 30
+const defaultTickRate = 20
+
+// RealtimeTickMs returns the fixed timestep in ms for a real-time game (1000 /
+// clamped tickRate) and ok=true, or ok=false for a turn-based game. Parsed from
+// the manifest's `realtime` block that the catalog already carries.
+func (g RegGame) RealtimeTickMs() (int, bool) {
+	if len(g.Manifest) == 0 {
+		return 0, false
+	}
+	var m struct {
+		Realtime *struct {
+			Tick     bool `json:"tick"`
+			TickRate int  `json:"tickRate"`
+		} `json:"realtime"`
+	}
+	if err := json.Unmarshal(g.Manifest, &m); err != nil || m.Realtime == nil || !m.Realtime.Tick {
+		return 0, false
+	}
+	rate := m.Realtime.TickRate
+	if rate <= 0 {
+		rate = defaultTickRate
+	}
+	if rate > maxTickRate {
+		rate = maxTickRate
+	}
+	return 1000 / rate, true
+}
 
 // CatalogFull returns the registry's published games with metadata + ratings.
 func (r *RegistryClient) CatalogFull(ctx context.Context) ([]RegGame, error) {
